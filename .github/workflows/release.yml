@@ -55,6 +55,8 @@ jobs:
         with:
           bun-version: latest
       - run: bun install
+      - name: Patch blessed for static requires
+        run: node scripts/patch-blessed.cjs
       - run: bun run build
       - name: Build standalone binary
         run: bun build dist/index.js --compile --outfile ${{ matrix.artifact }}
