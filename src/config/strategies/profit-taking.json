@@ -1,0 +1,40 @@
+{
+  "marketId": "default",
+  "name": "Profit Taking",
+  "orderConfig": {
+    "orderType": "Spot",
+    "priceMode": "offsetFromMid",
+    "priceOffsetPercent": 0.05,
+    "maxSpreadPercent": 1.5,
+    "side": "Both",
+    "priceRandomizationEnabled": false,
+    "priceRandomizationRangePercent": 0.05
+  },
+  "positionSizing": {
+    "sizeMode": "percentageOfBalance",
+    "balancePercentage": 100,
+    "baseBalancePercentage": 100,
+    "quoteBalancePercentage": 100,
+    "minOrderSizeUsd": 5
+  },
+  "orderManagement": {
+    "trackFillPrices": true,
+    "onlySellAboveBuyPrice": true,
+    "maxOpenOrders": 2
+  },
+  "riskManagement": {
+    "takeProfitPercent": 0.1,
+    "stopLossEnabled": false,
+    "stopLossPercent": 5,
+    "orderTimeoutEnabled": true,
+    "orderTimeoutMinutes": 15,
+    "maxSessionLossEnabled": false,
+    "maxSessionLossUsd": 100
+  },
+  "timing": {
+    "cycleIntervalMinMs": 4000,
+    "cycleIntervalMaxMs": 7000
+  },
+  "consoleMode": "simple",
+  "isActive": true
+}

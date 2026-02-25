@@ -1,0 +1,40 @@
+{
+  "marketId": "default",
+  "name": "Volume Maximizing",
+  "orderConfig": {
+    "orderType": "Market",
+    "priceMode": "market",
+    "priceOffsetPercent": 0,
+    "maxSpreadPercent": 5.0,
+    "side": "Both",
+    "priceRandomizationEnabled": false,
+    "priceRandomizationRangePercent": 0.05
+  },
+  "positionSizing": {
+    "sizeMode": "percentageOfBalance",
+    "balancePercentage": 100,
+    "baseBalancePercentage": 100,
+    "quoteBalancePercentage": 100,
+    "minOrderSizeUsd": 5
+  },
+  "orderManagement": {
+    "trackFillPrices": true,
+    "onlySellAboveBuyPrice": false,
+    "maxOpenOrders": 3
+  },
+  "riskManagement": {
+    "takeProfitPercent": 0,
+    "stopLossEnabled": false,
+    "stopLossPercent": 5,
+    "orderTimeoutEnabled": false,
+    "orderTimeoutMinutes": 30,
+    "maxSessionLossEnabled": false,
+    "maxSessionLossUsd": 100
+  },
+  "timing": {
+    "cycleIntervalMinMs": 1000,
+    "cycleIntervalMaxMs": 2000
+  },
+  "consoleMode": "simple",
+  "isActive": true
+}

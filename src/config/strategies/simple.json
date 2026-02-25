@@ -1,0 +1,40 @@
+{
+  "marketId": "default",
+  "name": "Simple Mode",
+  "orderConfig": {
+    "orderType": "Spot",
+    "priceMode": "offsetFromMid",
+    "priceOffsetPercent": 0.1,
+    "maxSpreadPercent": 2.0,
+    "side": "Both",
+    "priceRandomizationEnabled": false,
+    "priceRandomizationRangePercent": 0.05
+  },
+  "positionSizing": {
+    "sizeMode": "percentageOfBalance",
+    "balancePercentage": 100,
+    "baseBalancePercentage": 100,
+    "quoteBalancePercentage": 100,
+    "minOrderSizeUsd": 5
+  },
+  "orderManagement": {
+    "trackFillPrices": true,
+    "onlySellAboveBuyPrice": true,
+    "maxOpenOrders": 2
+  },
+  "riskManagement": {
+    "takeProfitPercent": 0.02,
+    "stopLossEnabled": false,
+    "stopLossPercent": 5,
+    "orderTimeoutEnabled": false,
+    "orderTimeoutMinutes": 30,
+    "maxSessionLossEnabled": false,
+    "maxSessionLossUsd": 100
+  },
+  "timing": {
+    "cycleIntervalMinMs": 3000,
+    "cycleIntervalMaxMs": 5000
+  },
+  "consoleMode": "simple",
+  "isActive": true
+}
