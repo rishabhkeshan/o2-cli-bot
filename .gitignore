@@ -5,3 +5,4 @@ data/
 .env.local
 *.db
 *.db-journal
+.npmrc
