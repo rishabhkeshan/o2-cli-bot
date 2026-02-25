@@ -33,7 +33,7 @@ const program = new Command();
 program
   .name('o2-bot')
   .description('CLI-based automated trading bot for O2 Exchange')
-  .version('1.0.0');
+  .version('1.0.1');
 
 program
   .command('start', { isDefault: true })
