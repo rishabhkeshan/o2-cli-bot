@@ -127,6 +127,20 @@ export class StrategyExecutor {
       this.balanceTracker.clearCache(market.market_id);
       const balances = await this.balanceTracker.getMarketBalances(market.market_id);
 
+      // Early exit: skip if both balances are below minimum order size
+      const quoteHuman = new Decimal(balances.quote.unlocked).div(new Decimal(10).pow(market.quote.decimals));
+      const baseHuman = new Decimal(balances.base.unlocked).div(new Decimal(10).pow(market.base.decimals));
+      const midPrice = this.marketData.getMidPrice(market.market_id) || 0;
+      const baseValueUsd = midPrice > 0 ? baseHuman.mul(midPrice).toNumber() : 0;
+      const minSize = config.positionSizing.minOrderSizeUsd || 5;
+
+      if (quoteHuman.toNumber() < minSize && baseValueUsd < minSize) {
+        return {
+          executed: false, orders: [], nextRunAt,
+          skipReason: `${pair}: Insufficient balance (${quoteHuman.toFixed(2)} ${market.quote.symbol}, ${baseHuman.toFixed(4)} ${market.base.symbol})`,
+        };
+      }
+
       // ---------------------------------------------------------------
       // 6. CHECK MAX OPEN ORDERS PER SIDE
       // ---------------------------------------------------------------
@@ -639,12 +653,11 @@ export class StrategyExecutor {
         isLimitOrder,
       };
     } catch (error: any) {
-      const apiMsg = error.response?.data ? JSON.stringify(error.response.data) : '';
       return {
         orderId: '',
         side: 'Buy',
         success: false,
-        error: apiMsg ? `${error.message}: ${apiMsg}` : error.message,
+        error: this.formatError(error),
         errorDetails: error,
         marketPair,
       };
@@ -763,12 +776,11 @@ export class StrategyExecutor {
         isLimitOrder,
       };
     } catch (error: any) {
-      const apiMsg = error.response?.data ? JSON.stringify(error.response.data) : '';
       return {
         orderId: '',
         side: 'Sell',
         success: false,
-        error: apiMsg ? `${error.message}: ${apiMsg}` : error.message,
+        error: this.formatError(error),
         errorDetails: error,
         marketPair,
       };
@@ -778,6 +790,24 @@ export class StrategyExecutor {
   // =========================================================================
   // SPREAD CALCULATION (depth-aware)
   // =========================================================================
+
+  /**
+   * Extract a short, readable error message from API errors.
+   */
+  private formatError(error: any): string {
+    const raw = error.response?.data ? JSON.stringify(error.response.data) : error.message || '';
+    // Extract known error patterns
+    const notEnough = raw.match(/NotEnoughBalance/);
+    if (notEnough) return 'NotEnoughBalance';
+    const nonceErr = raw.match(/Nonce in the request\((\d+)\) is less than.*database\((\d+)\)/);
+    if (nonceErr) return `Nonce stale (local:${nonceErr[1]} server:${nonceErr[2]})`;
+    const reasonMatch = raw.match(/"reason":"([^"]{1,80})"/);
+    if (reasonMatch) return reasonMatch[1].slice(0, 80);
+    const msgMatch = raw.match(/"message":"([^"]{1,80})"/);
+    if (msgMatch) return msgMatch[1].slice(0, 80);
+    // Truncate to 100 chars
+    return (error.message || raw).slice(0, 100);
+  }
 
   /**
    * Calculate VWAP (Volume-Weighted Average Price) for a given order size.

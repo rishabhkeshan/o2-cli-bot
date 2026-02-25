@@ -65,6 +65,10 @@ export class TradingEngine extends EventEmitter {
   updateConfig(marketId: string, config: StrategyConfig): void {
     const schedule = this.schedules.get(marketId);
     if (schedule) {
+      // Preserve runtime tracking state from old config
+      config.averageBuyPrice = schedule.config.averageBuyPrice;
+      config.averageSellPrice = schedule.config.averageSellPrice;
+      config.lastFillPrices = schedule.config.lastFillPrices;
       schedule.config = config;
       // Persist to DB
       dbQueries.upsertStrategyConfig(marketId, config);

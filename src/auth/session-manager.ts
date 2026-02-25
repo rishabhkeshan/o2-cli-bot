@@ -313,26 +313,38 @@ export class SessionManager extends EventEmitter {
     } catch (err: any) {
       const errStr = JSON.stringify(err?.response?.data ?? err?.message ?? '');
 
-      // Parse on-chain nonce from IncrementNonceEvent
-      const nonceMatch = errStr.match(/IncrementNonceEvent\s*\{\s*nonce:\s*(\d+)\s*\}/);
-      if (nonceMatch) {
-        this.nonce = bn(nonceMatch[1]);
-      } else {
+      // Sync nonce from error response
+      let nonceSynced = false;
+
+      // 1. Parse on-chain nonce from IncrementNonceEvent (reverted transactions still increment)
+      const incrementMatch = errStr.match(/IncrementNonceEvent\s*\{\s*nonce:\s*(\d+)\s*\}/);
+      if (incrementMatch) {
+        this.nonce = bn(incrementMatch[1]);
+        nonceSynced = true;
+      }
+
+      // 2. Parse expected nonce from "less than the nonce in the database(N)" error
+      if (!nonceSynced) {
+        const dbNonceMatch = errStr.match(/nonce in the database\((\d+)\)/);
+        if (dbNonceMatch) {
+          this.nonce = bn(dbNonceMatch[1]);
+          nonceSynced = true;
+        }
+      }
+
+      // 3. Fallback: fetch nonce from API
+      if (!nonceSynced) {
         await this.fetchNonce().catch(() => {});
       }
 
-      // Handle invalid session - recreate and retry
-      if (!isRetry && errStr.includes('Invalid session address')) {
-        this.emit('sessionInvalid');
-        this.sessionSigner = new FuelSessionSigner();
-        await this.fetchNonce();
-        // Need to recreate session - emit event for engine to handle
-        // For now, just re-throw
+      // Retry once on nonce mismatch (nonce is now synced)
+      if (!isRetry && (errStr.includes('nonce') || errStr.includes('Nonce')) && !errStr.includes('Invalid session')) {
+        return this.submitActionsImpl(marketId, market, actions, true);
       }
 
-      // Signal nonce error
-      if (errStr.includes('nonce') || errStr.includes('Nonce')) {
-        this.emit('nonceError');
+      // Handle invalid session
+      if (!isRetry && errStr.includes('Invalid session address')) {
+        this.emit('sessionInvalid');
       }
 
       throw err;

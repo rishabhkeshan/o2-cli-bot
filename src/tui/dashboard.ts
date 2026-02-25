@@ -3,11 +3,16 @@ import type { TradingEngine, TradingContext } from '../engine/trading-engine.js'
 import type { PnLCalculator } from '../engine/pnl-calculator.js';
 import type { MarketDataService } from '../engine/market-data.js';
 import type { BalanceTracker } from '../engine/balance-tracker.js';
+import type { OrderManager } from '../engine/order-manager.js';
 import type { O2RestClient } from '../api/rest-client.js';
 import type { Market, Bar, OrderBookDepth, MarketTicker } from '../types/market.js';
+import type { Order } from '../types/order.js';
 import type { Logger } from './logger.js';
+import type { StrategyPreset } from '../types/strategy.js';
+import { getPresetStrategyConfig, STRATEGY_PRESET_LABELS } from '../types/strategy.js';
 
 const RESOLUTIONS = ['1m', '5m', '15m', '1h', '4h', '1d'] as const;
+const STRATEGY_PRESETS: StrategyPreset[] = ['simple', 'volumeMaximizing', 'profitTaking'];
 
 // ─── Smart number formatting ────────────────────────────────
 // Auto-detects needed decimal places based on magnitude
@@ -61,6 +66,7 @@ export class Dashboard {
   private marketData: MarketDataService;
   private balanceTracker: BalanceTracker;
   private restClient: O2RestClient;
+  private orderManager: OrderManager | null = null;
   private logger: Logger;
   private startTime: number = Date.now();
   private rendering = false;
@@ -73,6 +79,9 @@ export class Dashboard {
   private resolutionIndex = 0;
   private bars: Bar[] = [];
   private lastBarFetch = 0;
+  private openOrders: Order[] = [];
+  private lastOrdersFetch = 0;
+  private currentPresetIndex = 0;
 
   constructor(opts: {
     engine: TradingEngine;
@@ -80,6 +89,7 @@ export class Dashboard {
     marketData: MarketDataService;
     balanceTracker: BalanceTracker;
     restClient: O2RestClient;
+    orderManager?: OrderManager;
     logger: Logger;
     noTui?: boolean;
     onQuit?: () => void;
@@ -90,11 +100,19 @@ export class Dashboard {
     this.marketData = opts.marketData;
     this.balanceTracker = opts.balanceTracker;
     this.restClient = opts.restClient;
+    this.orderManager = opts.orderManager || null;
     this.logger = opts.logger;
     this.noTui = opts.noTui || false;
     this.onQuit = opts.onQuit;
-    // Use only the user's requested markets, not all exchange markets
     this.markets = opts.markets || this.marketData.getAllMarkets();
+
+    // Detect initial strategy preset from engine context
+    const contexts = this.engine.getContexts();
+    if (contexts.length > 0) {
+      const name = contexts[0].strategy?.toLowerCase() || '';
+      const idx = STRATEGY_PRESETS.findIndex(p => name.includes(p.toLowerCase()));
+      if (idx >= 0) this.currentPresetIndex = idx;
+    }
   }
 
   start(): void {
@@ -181,6 +199,16 @@ export class Dashboard {
       this.lastBarFetch = 0;
       this.addLog(`Chart resolution: ${RESOLUTIONS[this.resolutionIndex]}`);
     });
+    this.screen.key(['s'], () => {
+      this.currentPresetIndex = (this.currentPresetIndex + 1) % STRATEGY_PRESETS.length;
+      const preset = STRATEGY_PRESETS[this.currentPresetIndex];
+      const label = STRATEGY_PRESET_LABELS[preset];
+      for (const market of this.markets) {
+        const newConfig = getPresetStrategyConfig(market.market_id, preset);
+        this.engine.updateConfig(market.market_id, newConfig);
+      }
+      this.addLog(`{cyan-fg}Strategy switched to: ${label}{/cyan-fg}`);
+    });
 
     this.logger.onLog((_level, msg) => this.addLog(msg));
     this.engine.on('cycle', (_mId: string, result: any) => {
@@ -191,6 +219,8 @@ export class Dashboard {
             this.addLog(`{${c}-fg}${o.side}{/${c}-fg} ${o.quantityHuman} @ ${o.priceHuman} (${o.marketPair})`);
           } else if (o.error) this.addLog(`{red-fg}Failed: ${o.error}{/red-fg}`);
         }
+      } else if (result.skipReason) {
+        this.addLog(`{yellow-fg}Skip: ${result.skipReason}{/yellow-fg}`);
       }
     });
     this.engine.on('error', (mId: string, err: Error) => {
@@ -205,6 +235,14 @@ export class Dashboard {
 
   private get currentMarket(): Market | undefined {
     return this.markets[this.currentMarketIndex];
+  }
+
+  private async fetchOpenOrders(market: Market): Promise<void> {
+    if (!this.orderManager) return;
+    try {
+      this.openOrders = await this.orderManager.getOpenOrders(market);
+    } catch { /* ignore */ }
+    this.lastOrdersFetch = Date.now();
   }
 
   private async fetchBars(): Promise<void> {
@@ -224,6 +262,7 @@ export class Dashboard {
       if (!market) return;
 
       if (Date.now() - this.lastBarFetch > 15000) this.fetchBars();
+      if (Date.now() - this.lastOrdersFetch > 5000) this.fetchOpenOrders(market);
 
       // Use cached data from market data service (updated by polling/WS)
       const ticker = this.marketData.getCachedTicker(market.market_id);
@@ -263,10 +302,12 @@ export class Dashboard {
       ? ` {cyan-fg}(${this.currentMarketIndex + 1}/${this.markets.length}){/cyan-fg} [◀/▶]`
       : '';
 
+    const stratLabel = STRATEGY_PRESET_LABELS[STRATEGY_PRESETS[this.currentPresetIndex]];
+
     this.headerBox.setContent(
       `{bold}${pair}{/bold}${marketNav}  $${price}  {${changeColor}-fg}${parseFloat(change) >= 0 ? '+' : ''}${change}%{/${changeColor}-fg}  ` +
       `H:$${high}  L:$${low}  Vol:${vol}  |  ` +
-      `${status}  ${uptime}  |  [q]uit [p]ause [r]es:${res}` +
+      `${status}  ${uptime}  |  [q]uit [p]ause [r]es:${res} [s]:${stratLabel}` +
       (this.markets.length > 1 ? ' [[]prev []]next' : '')
     );
   }
@@ -491,6 +532,21 @@ export class Dashboard {
       content += `\n{bold} Strategy{/bold}\n`;
       content += `  ${ctx.strategy} (${ctx.pair})\n`;
       content += `  ${ctx.isActive ? '{green-fg}Active{/green-fg}' : '{red-fg}Inactive{/red-fg}'}\n`;
+    }
+
+    // Open Orders
+    if (this.openOrders.length > 0) {
+      const baseScale = 10 ** market.base.decimals;
+      content += `\n{bold} Open Orders (${this.openOrders.length}){/bold}\n`;
+      for (const o of this.openOrders.slice(0, 6)) {
+        const side = o.side === 'Buy' ? '{green-fg}BUY{/green-fg}' : '{red-fg}SELL{/red-fg}';
+        const price = fmtPrice(parseFloat(o.price) / baseScale);
+        const qty = fmtQty(parseFloat(o.quantity) / baseScale);
+        content += `  ${side}  ${qty} @ $${price}\n`;
+      }
+      if (this.openOrders.length > 6) {
+        content += `  ... +${this.openOrders.length - 6} more\n`;
+      }
     }
 
     this.balancePnlBox.setContent(content);

@@ -21,19 +21,16 @@ import { Dashboard } from './tui/dashboard.js';
 import { Logger } from './tui/logger.js';
 import type { Market } from './types/market.js';
 import type { StrategyConfig } from './types/strategy.js';
-import { readFileSync, existsSync, writeFileSync } from 'fs';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+import { existsSync, writeFileSync } from 'fs';
+import { resolve } from 'path';
+import orderBookAbiJson from './types/contracts/orderbook-abi.json' with { type: 'json' };
 
 const program = new Command();
 
 program
   .name('o2-bot')
   .description('CLI-based automated trading bot for O2 Exchange')
-  .version('1.0.1');
+  .version('1.0.2');
 
 program
   .command('start', { isDefault: true })
@@ -257,16 +254,8 @@ async function startBot(opts: {
     dbQueries.upsertNonce(tradeAccountId, nonce);
   };
 
-  // Load OrderBook ABI
-  let orderBookAbi: any;
-  try {
-    const abiPath = resolve(__dirname, 'types', 'contracts', 'orderbook-abi.json');
-    orderBookAbi = JSON.parse(readFileSync(abiPath, 'utf-8'));
-  } catch {
-    // Try from src directory (dev mode)
-    const abiPath = resolve(__dirname, '..', 'src', 'types', 'contracts', 'orderbook-abi.json');
-    orderBookAbi = JSON.parse(readFileSync(abiPath, 'utf-8'));
-  }
+  // Load OrderBook ABI (imported as JSON module so it works in bun compiled binaries)
+  const orderBookAbi = orderBookAbiJson;
 
   // Initialize session
   logger.info('Setting up trade account and session...', 'Boot');
@@ -439,6 +428,7 @@ async function startBot(opts: {
     if (!shuttingDown) notifications.notify('BOT_STOPPED', 'Trading bot stopped');
   });
   engine.on('error', (marketId: string, err: Error) => {
+    logger.error(`${err.message}`, marketId.slice(0, 8));
     notifications.notify('ERROR', `Market ${marketId}: ${err.message}`);
   });
   orderManager.on('fill', (fill) => {
@@ -446,6 +436,8 @@ async function startBot(opts: {
     if (market) {
       const priceHuman = fill.price / 10 ** market.quote.decimals;
       const sizeHuman = fill.sizeBase / 10 ** market.base.decimals;
+      const pair = `${market.base.symbol}/${market.quote.symbol}`;
+      logger.info(`FILLED ${fill.side} ${sizeHuman.toFixed(6)} ${market.base.symbol} @ $${priceHuman.toFixed(4)} (${pair})`, 'Fill');
       notifications.notify(
         'ORDER_FILLED',
         `${fill.side} ${sizeHuman.toFixed(6)} ${market.base.symbol} @ $${priceHuman.toFixed(4)}`
@@ -460,6 +452,7 @@ async function startBot(opts: {
     marketData,
     balanceTracker,
     restClient,
+    orderManager,
     logger,
     noTui: !opts.tui,
     onQuit: () => shutdown(),
