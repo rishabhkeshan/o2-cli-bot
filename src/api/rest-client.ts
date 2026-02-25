@@ -217,6 +217,30 @@ export class O2RestClient {
     return data;
   }
 
+  // Competition / Leaderboard
+  async getCompetitions(): Promise<any[]> {
+    try {
+      const { data } = await this.http.get('/analytics/v1/competition/list');
+      return data.competitions || data || [];
+    } catch {
+      return [];
+    }
+  }
+
+  async getLeaderboard(competitionId: string, walletAddress: string): Promise<any> {
+    try {
+      const { data } = await this.http.get('/analytics/v1/competition/leaderboard', {
+        params: {
+          competition_id: competitionId,
+          current_address: walletAddress.toLowerCase(),
+        },
+      });
+      return data;
+    } catch {
+      return null;
+    }
+  }
+
   // Map API order format to internal Order type
   private mapOrder(o: any): Order {
     let status: OrderStatus;

@@ -82,6 +82,9 @@ export class Dashboard {
   private openOrders: Order[] = [];
   private lastOrdersFetch = 0;
   private currentPresetIndex = 0;
+  private ownerAddress: string = '';
+  private competitionStats: { rank: string; score: string; volume: string; pnl: string; title: string } | null = null;
+  private lastCompetitionFetch = 0;
 
   constructor(opts: {
     engine: TradingEngine;
@@ -94,6 +97,7 @@ export class Dashboard {
     noTui?: boolean;
     onQuit?: () => void;
     markets?: Market[];
+    ownerAddress?: string;
   }) {
     this.engine = opts.engine;
     this.pnlCalc = opts.pnlCalc;
@@ -105,6 +109,7 @@ export class Dashboard {
     this.noTui = opts.noTui || false;
     this.onQuit = opts.onQuit;
     this.markets = opts.markets || this.marketData.getAllMarkets();
+    this.ownerAddress = opts.ownerAddress || '';
 
     // Detect initial strategy preset from engine context
     const contexts = this.engine.getContexts();
@@ -144,16 +149,16 @@ export class Dashboard {
     this.screen = blessed.screen({ smartCSR: true, title: 'O2 CLI Trading Bot', fullUnicode: true });
 
     this.headerBox = blessed.box({
-      top: 0, left: 0, width: '100%', height: 3,
+      top: 0, left: 0, width: '100%', height: 4,
       tags: true, style: { fg: 'white', bg: '#1a1a2e' }, padding: { left: 1 },
     });
     this.chartBox = blessed.box({
-      top: 3, left: 0, width: '65%', height: '55%-3',
+      top: 4, left: 0, width: '65%', height: '55%-4',
       label: ' Chart ', border: { type: 'line' }, tags: true,
       style: { border: { fg: '#444' }, fg: 'white' }, padding: { left: 0, right: 0 },
     });
     this.orderbookBox = blessed.box({
-      top: 3, left: '65%', width: '35%', height: '55%-3',
+      top: 4, left: '65%', width: '35%', height: '55%-4',
       label: ' Order Book ', border: { type: 'line' }, tags: true,
       style: { border: { fg: '#444' }, fg: 'white' }, padding: { left: 0, right: 0 },
     });
@@ -245,6 +250,52 @@ export class Dashboard {
     this.lastOrdersFetch = Date.now();
   }
 
+  private async fetchCompetitionStats(): Promise<void> {
+    if (!this.ownerAddress) return;
+    try {
+      const competitions = await this.restClient.getCompetitions();
+      // Find active competition (not "Hall of Fame", started, not ended)
+      const now = Date.now();
+      const active = competitions.find((c: any) => {
+        if (c.title?.includes('Hall of Fame')) return false;
+        const start = new Date(c.startDate).getTime();
+        const end = c.endDate ? new Date(c.endDate).getTime() : Infinity;
+        return start <= now && end >= now;
+      });
+      if (!active) { this.competitionStats = null; return; }
+
+      const lb = await this.restClient.getLeaderboard(active.competitionId, this.ownerAddress);
+      if (lb?.currentUser) {
+        const u = lb.currentUser;
+        this.competitionStats = {
+          rank: u.rank || '-',
+          score: this.fmtBigNum(u.score),
+          volume: this.fmtBigNum(u.volume),
+          pnl: this.fmtBigNum(u.pnl),
+          title: lb.title || active.title || 'Competition',
+        };
+      } else {
+        this.competitionStats = null;
+      }
+    } catch {
+      // silently ignore
+    }
+    this.lastCompetitionFetch = Date.now();
+  }
+
+  private fmtBigNum(val: string | undefined): string {
+    if (!val) return '0';
+    // Values come with 9 decimal places
+    const n = parseFloat(val) / 1e9;
+    if (Math.abs(n) >= 1e12) return (n / 1e12).toFixed(1) + 'T';
+    if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+    if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    if (Math.abs(n) >= 1) return n.toFixed(2);
+    if (Math.abs(n) >= 0.01) return n.toFixed(4);
+    return n.toFixed(2);
+  }
+
   private async fetchBars(): Promise<void> {
     const market = this.currentMarket;
     if (!market) return;
@@ -263,6 +314,7 @@ export class Dashboard {
 
       if (Date.now() - this.lastBarFetch > 15000) this.fetchBars();
       if (Date.now() - this.lastOrdersFetch > 5000) this.fetchOpenOrders(market);
+      if (Date.now() - this.lastCompetitionFetch > 60000) this.fetchCompetitionStats();
 
       // Use cached data from market data service (updated by polling/WS)
       const ticker = this.marketData.getCachedTicker(market.market_id);
@@ -304,12 +356,19 @@ export class Dashboard {
 
     const stratLabel = STRATEGY_PRESET_LABELS[STRATEGY_PRESETS[this.currentPresetIndex]];
 
-    this.headerBox.setContent(
-      `{bold}${pair}{/bold}${marketNav}  $${price}  {${changeColor}-fg}${parseFloat(change) >= 0 ? '+' : ''}${change}%{/${changeColor}-fg}  ` +
+    let line1 = `{bold}${pair}{/bold}${marketNav}  $${price}  {${changeColor}-fg}${parseFloat(change) >= 0 ? '+' : ''}${change}%{/${changeColor}-fg}  ` +
       `H:$${high}  L:$${low}  Vol:${vol}  |  ` +
       `${status}  ${uptime}  |  [q]uit [p]ause [r]es:${res} [s]:${stratLabel}` +
-      (this.markets.length > 1 ? ' [[]prev []]next' : '')
-    );
+      (this.markets.length > 1 ? ' [[]prev []]next' : '');
+
+    if (this.competitionStats) {
+      const c = this.competitionStats;
+      const pnlNum = parseFloat(c.pnl) || 0;
+      const pnlColor = pnlNum >= 0 ? 'green' : 'red';
+      line1 += `\n{bold}{cyan-fg}${c.title}{/cyan-fg}{/bold}  Rank: {bold}#${c.rank}{/bold}  Score: ${c.score}  Vol: $${c.volume}  P&L: {${pnlColor}-fg}$${c.pnl}{/${pnlColor}-fg}`;
+    }
+
+    this.headerBox.setContent(line1);
   }
 
   // ─── Candlestick Chart ─────────────────────────────────

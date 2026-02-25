@@ -30,7 +30,7 @@ const program = new Command();
 program
   .name('o2-bot')
   .description('CLI-based automated trading bot for O2 Exchange')
-  .version('1.0.2');
+  .version('1.0.3');
 
 program
   .command('start', { isDefault: true })
@@ -457,6 +457,7 @@ async function startBot(opts: {
     noTui: !opts.tui,
     onQuit: () => shutdown(),
     markets: requestedMarkets,
+    ownerAddress: walletManager.ownerAddress,
   });
 
   // Graceful shutdown
