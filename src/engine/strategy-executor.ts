@@ -191,11 +191,17 @@ export class StrategyExecutor {
       // ---------------------------------------------------------------
       // 8. PLACE BUY ORDER
       // ---------------------------------------------------------------
+      const skipReasons: string[] = [];
+
       if (willPlaceBuy) {
         const buyOrder = await this.placeBuyOrder(market, config, prices.buyPrice, balances, ticker, orderBook);
         if (buyOrder) {
           orders.push(buyOrder);
+        } else {
+          skipReasons.push(this.diagnoseBuySkip(market, config, prices.buyPrice, balances));
         }
+      } else if (!shouldPlaceBuy && (config.orderConfig.side === 'Buy' || config.orderConfig.side === 'Both')) {
+        skipReasons.push('Buy: max open orders reached');
       }
 
       // ---------------------------------------------------------------
@@ -223,18 +229,41 @@ export class StrategyExecutor {
         const sellOrder = await this.placeSellOrder(market, configForSell, prices.sellPrice, balances, ticker, orderBook);
         if (sellOrder) {
           orders.push(sellOrder);
+        } else {
+          skipReasons.push(this.diagnoseSellSkip(market, configForSell, prices.sellPrice, balances));
         }
+      } else if (!shouldPlaceSell && (config.orderConfig.side === 'Sell' || config.orderConfig.side === 'Both')) {
+        skipReasons.push('Sell: max open orders reached');
       }
 
       // ---------------------------------------------------------------
       // 10. RETURN RESULTS
       // ---------------------------------------------------------------
-      return {
-        executed: orders.length > 0,
+      const successfulOrders = orders.filter(o => o.success);
+      const failedOrders = orders.filter(o => !o.success && o.error);
+
+      const result: StrategyExecutionResult = {
+        executed: successfulOrders.length > 0,
         orders,
         nextRunAt,
       };
+
+      // Surface reasons when no orders were successfully placed
+      if (!result.executed) {
+        const allReasons: string[] = [];
+        for (const o of failedOrders) {
+          allReasons.push(`${o.side}: ${o.error}`);
+        }
+        allReasons.push(...skipReasons);
+        if (allReasons.length > 0) {
+          result.skipReason = `${pair}: ${allReasons.join('; ')}`;
+        }
+      }
+
+      return result;
     } catch (error: any) {
+      const errMsg = `${pair}: Execution error — ${error.message || error}`;
+      console.error(`[StrategyExecutor] ${errMsg}`);
       return {
         executed: false,
         orders: [
@@ -246,6 +275,7 @@ export class StrategyExecutor {
             errorDetails: error,
           },
         ],
+        skipReason: errMsg,
       };
     }
   }
@@ -653,11 +683,13 @@ export class StrategyExecutor {
         isLimitOrder,
       };
     } catch (error: any) {
+      const formattedError = this.formatError(error);
+      console.error(`[StrategyExecutor] Buy order failed (${marketPair}): ${formattedError}`);
       return {
         orderId: '',
         side: 'Buy',
         success: false,
-        error: this.formatError(error),
+        error: formattedError,
         errorDetails: error,
         marketPair,
       };
@@ -776,11 +808,13 @@ export class StrategyExecutor {
         isLimitOrder,
       };
     } catch (error: any) {
+      const formattedError = this.formatError(error);
+      console.error(`[StrategyExecutor] Sell order failed (${marketPair}): ${formattedError}`);
       return {
         orderId: '',
         side: 'Sell',
         success: false,
-        error: this.formatError(error),
+        error: formattedError,
         errorDetails: error,
         marketPair,
       };
@@ -801,12 +835,80 @@ export class StrategyExecutor {
     if (notEnough) return 'NotEnoughBalance';
     const nonceErr = raw.match(/Nonce in the request\((\d+)\) is less than.*database\((\d+)\)/);
     if (nonceErr) return `Nonce stale (local:${nonceErr[1]} server:${nonceErr[2]})`;
-    const reasonMatch = raw.match(/"reason":"([^"]{1,80})"/);
-    if (reasonMatch) return reasonMatch[1].slice(0, 80);
-    const msgMatch = raw.match(/"message":"([^"]{1,80})"/);
-    if (msgMatch) return msgMatch[1].slice(0, 80);
-    // Truncate to 100 chars
-    return (error.message || raw).slice(0, 100);
+    // Look for Fuel VM panic/revert reasons
+    const panicMatch = raw.match(/PanicInstruction\s*\{\s*reason:\s*(\w+)/);
+    if (panicMatch) return `VM panic: ${panicMatch[1]}`;
+    const revertMatch = raw.match(/Revert\((\d+)\)/);
+    if (revertMatch) return `Revert(${revertMatch[1]})`;
+    // Look for receipt-level errors
+    const receiptPanic = raw.match(/"reason_str":"([^"]+)"/);
+    if (receiptPanic) return receiptPanic[1].slice(0, 100);
+    // Look for specific O2 error messages
+    const invalidSession = raw.match(/Invalid session/i);
+    if (invalidSession) return 'Invalid session';
+    const reasonMatch = raw.match(/"reason":"([^"]{1,120})"/);
+    if (reasonMatch) return reasonMatch[1].slice(0, 120);
+    // Generic message field - but show more context if it's "Failed to process transaction"
+    const msgMatch = raw.match(/"message":"([^"]{1,120})"/);
+    if (msgMatch) {
+      const msg = msgMatch[1];
+      if (msg === 'Failed to process transaction' && raw.length > msg.length + 30) {
+        // Show more of the error response for vague messages
+        return raw.slice(0, 200);
+      }
+      return msg.slice(0, 120);
+    }
+    // Truncate to 200 chars for better debugging
+    return (error.message || raw).slice(0, 200);
+  }
+
+  /**
+   * Diagnose why a buy order was not placed (returned null).
+   */
+  private diagnoseBuySkip(
+    market: Market,
+    config: StrategyConfig,
+    buyPrice: Decimal,
+    balances: MarketBalances
+  ): string {
+    if (!isValidPrice(buyPrice)) return 'Buy: invalid price (0/NaN)';
+    const quoteHuman = new Decimal(balances.quote.unlocked).div(new Decimal(10).pow(market.quote.decimals));
+    const orderSize = this.calculateOrderSize(market, config.positionSizing, balances, 'buy', buyPrice, config.orderConfig.orderType !== 'Spot');
+    if (!orderSize) return `Buy: order size calc failed (quote=${quoteHuman.toFixed(2)}, price=${buyPrice.toFixed(4)})`;
+    if (orderSize.quantity.eq(0)) return 'Buy: quantity rounds to 0';
+    const quantityRounded = roundDownToMarketPrecision(orderSize.quantity, market);
+    const orderValueUsd = quantityRounded.mul(buyPrice).toNumber();
+    if (orderValueUsd < config.positionSizing.minOrderSizeUsd) {
+      return `Buy: value $${orderValueUsd.toFixed(2)} < min $${config.positionSizing.minOrderSizeUsd}`;
+    }
+    return 'Buy: order placement failed';
+  }
+
+  /**
+   * Diagnose why a sell order was not placed (returned null).
+   */
+  private diagnoseSellSkip(
+    market: Market,
+    config: StrategyConfig,
+    sellPrice: Decimal,
+    balances: MarketBalances
+  ): string {
+    if (config.orderManagement.onlySellAboveBuyPrice) {
+      if (!config.averageBuyPrice || config.averageBuyPrice === '0') {
+        return 'Sell: no avg buy price (profit protection blocks)';
+      }
+    }
+    if (!isValidPrice(sellPrice)) return 'Sell: invalid price (0/NaN)';
+    const baseHuman = new Decimal(balances.base.unlocked).div(new Decimal(10).pow(market.base.decimals));
+    const orderSize = this.calculateOrderSize(market, config.positionSizing, balances, 'sell', sellPrice, config.orderConfig.orderType !== 'Spot');
+    if (!orderSize) return `Sell: order size calc failed (base=${baseHuman.toFixed(6)}, price=${sellPrice.toFixed(4)})`;
+    if (orderSize.quantity.eq(0)) return 'Sell: quantity rounds to 0';
+    const quantityRounded = roundDownToMarketPrecision(orderSize.quantity, market);
+    const orderValueUsd = quantityRounded.mul(sellPrice).toNumber();
+    if (orderValueUsd < config.positionSizing.minOrderSizeUsd) {
+      return `Sell: value $${orderValueUsd.toFixed(2)} < min $${config.positionSizing.minOrderSizeUsd}`;
+    }
+    return 'Sell: order placement failed';
   }
 
   /**
@@ -877,6 +979,8 @@ export class StrategyExecutor {
     const bestBid = new Decimal(bestBidEntry[0]).div(quoteScale);
     const bestAsk = new Decimal(bestAskEntry[0]).div(quoteScale);
     const midPrice = bestBid.plus(bestAsk).div(2);
+
+    if (midPrice.lte(0)) return null;
 
     const topOfBookSpread = bestAsk.minus(bestBid).div(midPrice).mul(100).toNumber();
 

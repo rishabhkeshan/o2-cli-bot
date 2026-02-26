@@ -347,9 +347,14 @@ export class SessionManager extends EventEmitter {
         return this.submitActionsImpl(marketId, market, actions, true);
       }
 
-      // Handle invalid session
+      // Handle invalid session — only fire on explicit session address error
       if (!isRetry && errStr.includes('Invalid session address')) {
         this.emit('sessionInvalid');
+      }
+
+      // Log full error for debugging opaque "Failed to process transaction" errors
+      if (errStr.includes('Failed to process transaction')) {
+        console.error(`[SessionManager] Full API error response: ${errStr.slice(0, 500)}`);
       }
 
       throw err;

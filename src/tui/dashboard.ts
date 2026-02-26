@@ -152,6 +152,12 @@ export class Dashboard {
       } else if (result.skipReason) {
         console.log(`[Skip] ${result.skipReason}`);
       }
+      // Also surface errors from orders even when not executed
+      if (!result.executed && result.orders) {
+        for (const order of result.orders) {
+          if (!order.success && order.error) console.error(`[Failed] ${order.error}`);
+        }
+      }
     });
     this.engine.on('error', (marketId: string, err: Error) => {
       console.error(`[Error] ${marketId}: ${err.message}`);
@@ -271,6 +277,12 @@ export class Dashboard {
         }
       } else if (result.skipReason) {
         this.addLog(`{yellow-fg}Skip: ${result.skipReason}{/yellow-fg}`);
+      }
+      // Also surface errors from orders even when not executed
+      if (!result.executed && result.orders) {
+        for (const o of result.orders) {
+          if (!o.success && o.error) this.addLog(`{red-fg}Failed: ${o.error}{/red-fg}`);
+        }
       }
     });
     this.engine.on('error', (mId: string, err: Error) => {

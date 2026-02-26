@@ -61,12 +61,16 @@ export class PnLCalculator extends EventEmitter {
       snap.buyCount++;
       snap.totalBuyValue += value;
       snap.totalBoughtQty += sizeHuman;
-      snap.averageBuyPrice = snap.totalBuyValue / snap.totalBoughtQty;
+      if (snap.totalBoughtQty > 0) {
+        snap.averageBuyPrice = snap.totalBuyValue / snap.totalBoughtQty;
+      }
     } else {
       snap.sellCount++;
       snap.totalSellValue += value;
       snap.totalSoldQty += sizeHuman;
-      snap.averageSellPrice = snap.totalSellValue / snap.totalSoldQty;
+      if (snap.totalSoldQty > 0) {
+        snap.averageSellPrice = snap.totalSellValue / snap.totalSoldQty;
+      }
 
       // Calculate realized PnL on sells (incremental, not cumulative)
       if (snap.averageBuyPrice > 0) {

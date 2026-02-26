@@ -30,7 +30,7 @@ const program = new Command();
 program
   .name('o2-bot')
   .description('CLI-based automated trading bot for O2 Exchange')
-  .version('1.0.4');
+  .version('1.0.5');
 
 program
   .command('start', { isDefault: true })
@@ -456,14 +456,19 @@ async function startBot(opts: {
     logger.warn('Session invalidated — recreating...', 'Session');
     try {
       engine.stop();
+      // Re-fetch nonce before creating session (may have drifted)
+      await sessionManager.initialize(orderBookAbi);
       const newSession = await sessionManager.createNewSession(requestedMarkets);
       for (const market of requestedMarkets) {
         sessionManager.initMarketContract(market);
       }
+      dashboard.updateSessionExpiry(newSession.expiry);
       logger.info(`Session recreated: ${newSession.sessionId.slice(0, 10)}...`, 'Session');
       engine.start();
     } catch (err: any) {
       logger.error(`Session recovery failed: ${err.message}`, 'Session');
+      // Restart engine anyway so trading can resume once session is valid
+      if (!engine.isRunning) engine.start();
     } finally {
       sessionRecovering = false;
     }
