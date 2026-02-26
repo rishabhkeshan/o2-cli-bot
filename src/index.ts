@@ -30,7 +30,7 @@ const program = new Command();
 program
   .name('o2-bot')
   .description('CLI-based automated trading bot for O2 Exchange')
-  .version('1.0.3');
+  .version('1.0.4');
 
 program
   .command('start', { isDefault: true })
@@ -333,6 +333,9 @@ async function startBot(opts: {
     logger.info(`Session created: ${sessionInfo.sessionId.slice(0, 10)}...`, 'Boot');
   }
 
+  // Store markets for session renewal (works after both restore and create)
+  sessionManager.setMarkets(requestedMarkets);
+
   // Initialize market contracts for order encoding
   for (const market of requestedMarkets) {
     sessionManager.initMarketContract(market);
@@ -445,6 +448,27 @@ async function startBot(opts: {
     }
   });
 
+  // Handle session invalidation (e.g., another client created a new session)
+  let sessionRecovering = false;
+  sessionManager.on('sessionInvalid', async () => {
+    if (sessionRecovering) return; // debounce
+    sessionRecovering = true;
+    logger.warn('Session invalidated — recreating...', 'Session');
+    try {
+      engine.stop();
+      const newSession = await sessionManager.createNewSession(requestedMarkets);
+      for (const market of requestedMarkets) {
+        sessionManager.initMarketContract(market);
+      }
+      logger.info(`Session recreated: ${newSession.sessionId.slice(0, 10)}...`, 'Session');
+      engine.start();
+    } catch (err: any) {
+      logger.error(`Session recovery failed: ${err.message}`, 'Session');
+    } finally {
+      sessionRecovering = false;
+    }
+  });
+
   // Initialize TUI Dashboard
   const dashboard = new Dashboard({
     engine,
@@ -452,18 +476,32 @@ async function startBot(opts: {
     marketData,
     balanceTracker,
     restClient,
+    wsClient,
     orderManager,
     logger,
     noTui: !opts.tui,
     onQuit: () => shutdown(),
     markets: requestedMarkets,
     ownerAddress: walletManager.ownerAddress,
+    tradeAccountId: sessionManager.tradeAccount,
+    sessionExpiry: sessionManager.session?.expiry || 0,
   });
 
-  // Graceful shutdown
+  // Graceful shutdown with timeout
   async function shutdown(): Promise<void> {
-    if (shuttingDown) return;
+    if (shuttingDown) {
+      // Double signal = force exit
+      console.error('\nForce exit.');
+      process.exit(1);
+    }
     shuttingDown = true;
+
+    // Hard timeout: force exit after 10s if shutdown hangs
+    const shutdownTimeout = setTimeout(() => {
+      console.error('\nShutdown timed out, forcing exit.');
+      process.exit(1);
+    }, 10_000);
+    shutdownTimeout.unref();
 
     logger.info('Shutting down...', 'Shutdown');
     await notifications.notify('BOT_STOPPED', 'Trading bot shutting down');
@@ -490,6 +528,7 @@ async function startBot(opts: {
     closeDb();
 
     logger.info('Shutdown complete', 'Shutdown');
+    clearTimeout(shutdownTimeout);
     process.exit(0);
   }
 
@@ -498,6 +537,9 @@ async function startBot(opts: {
   process.on('SIGINT', signalHandler);
   process.on('SIGTERM', signalHandler);
   process.on('SIGHUP', signalHandler);
+
+  // Subscribe to real-time trade feed
+  wsClient.subscribeTrades(requestedMarkets.map(m => m.market_id));
 
   // Fetch initial balances
   logger.info('Fetching initial balances...', 'Boot');

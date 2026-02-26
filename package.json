@@ -1,6 +1,6 @@
 {
   "name": "o2-cli-bot",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "CLI-based automated trading bot for O2 Exchange on Fuel Network",
   "type": "module",
   "main": "dist/index.js",

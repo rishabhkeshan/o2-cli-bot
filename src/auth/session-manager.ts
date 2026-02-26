@@ -137,6 +137,11 @@ export class SessionManager extends EventEmitter {
     }
   }
 
+  /** Store markets for session renewal (must be called after restore or create) */
+  setMarkets(markets: Market[]): void {
+    this.markets = markets;
+  }
+
   async createNewSession(markets: Market[]): Promise<SessionInfo> {
     this.markets = markets;
     const contractIds = [this.tradeAccountId, ...markets.map((m) => m.contract_id)];

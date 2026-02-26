@@ -115,6 +115,17 @@ export class TradingEngine extends EventEmitter {
     return contexts;
   }
 
+  getStrategyConfig(marketId: string): StrategyConfig | null {
+    const schedule = this.schedules.get(marketId);
+    return schedule ? schedule.config : null;
+  }
+
+  getNextRunTime(marketId: string): number | null {
+    const schedule = this.schedules.get(marketId);
+    if (!schedule || !schedule.config.isActive) return null;
+    return schedule.nextRunAt;
+  }
+
   private scheduleNext(): void {
     if (!this.running) return;
 

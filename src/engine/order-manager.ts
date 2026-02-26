@@ -207,6 +207,20 @@ export class OrderManager extends EventEmitter {
         order.price_fill,
         String(cumulativeFilledQty)
       );
+
+      // Remove fully filled orders from tracker to prevent memory leak
+      if (isFilled) {
+        this.previousFilledQty.delete(order.order_id);
+      }
+    }
+
+    // Cap tracker size: evict oldest entries if it grows too large
+    if (this.previousFilledQty.size > 500) {
+      const entries = [...this.previousFilledQty.entries()];
+      const toRemove = entries.slice(0, entries.length - 500);
+      for (const [key] of toRemove) {
+        this.previousFilledQty.delete(key);
+      }
     }
   }
 
