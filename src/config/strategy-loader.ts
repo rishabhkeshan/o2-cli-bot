@@ -57,7 +57,7 @@ export function resolveStrategy(
   strategiesDir: string
 ): StrategyConfig {
   // Check if it's a preset name
-  const presets: StrategyPreset[] = ['simple', 'volumeMaximizing', 'profitTaking', 'custom'];
+  const presets: StrategyPreset[] = ['simple', 'volumeMaximizing', 'profitTaking', 'competitionMode', 'custom'];
   if (presets.includes(source as StrategyPreset)) {
     return getPresetStrategyConfig(marketId, source as StrategyPreset);
   }
@@ -88,7 +88,7 @@ export function initStrategiesDir(dir: string): void {
     mkdirSync(dir, { recursive: true });
   }
 
-  const presets: StrategyPreset[] = ['simple', 'volumeMaximizing', 'profitTaking'];
+  const presets: StrategyPreset[] = ['simple', 'volumeMaximizing', 'profitTaking', 'competitionMode'];
   for (const preset of presets) {
     const filePath = resolve(dir, `${preset}.json`);
     if (!existsSync(filePath)) {

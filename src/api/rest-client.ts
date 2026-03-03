@@ -5,6 +5,7 @@ import type {
   SessionActionsRequest, SessionActionsResponse,
   CreateSessionRequest, GetAccountResponse, BalanceResponse
 } from '../types/api.js';
+import type { Competition, LeaderboardResponse, SubRankings, PrizePool } from '../types/competition.js';
 
 export class O2RestClient {
   private http: AxiosInstance;
@@ -218,24 +219,115 @@ export class O2RestClient {
   }
 
   // Competition / Leaderboard
-  async getCompetitions(): Promise<any[]> {
+  async getCompetitions(): Promise<Competition[]> {
     try {
       const { data } = await this.http.get('/analytics/v1/competition/list');
-      return data.competitions || data || [];
+      const raw: any[] = data.competitions || data || [];
+      return raw.map((c: any) => ({
+        competitionId: c.competitionId || c.competition_id || '',
+        slug: c.slug || '',
+        title: c.title || '',
+        subtitle: c.subtitle || '',
+        startDate: c.startDate || c.start_date || '',
+        endDate: c.endDate || c.end_date || '',
+        totalTraders: c.totalTraders ?? c.total_traders ?? 0,
+        totalVolume: String(c.totalVolume ?? c.total_volume ?? '0'),
+        layout: c.assets?.layout || c.layout || 'standard',
+        marketBoosts: c.marketBoosts || c.market_boosts || undefined,
+        streakConfig: c.streakConfig || c.streak_config || undefined,
+        placeholderVolumeTarget: c.placeholderVolumeTarget != null ? String(c.placeholderVolumeTarget) : undefined,
+      }));
     } catch {
       return [];
     }
   }
 
-  async getLeaderboard(competitionId: string, walletAddress: string): Promise<any> {
+  async getLeaderboard(competitionId: string, walletAddress: string): Promise<LeaderboardResponse | null> {
     try {
+      // Normalize: strip Fuel B256 zero-padding (0x000...{24 zeros}...addr) back to EVM 0x{40} format
+      let addr = walletAddress.toLowerCase();
+      const clean = addr.replace('0x', '');
+      if (clean.length === 64 && clean.startsWith('000000000000000000000000')) {
+        addr = '0x' + clean.slice(24);
+      }
       const { data } = await this.http.get('/analytics/v1/competition/leaderboard', {
         params: {
           competition_id: competitionId,
-          current_address: walletAddress.toLowerCase(),
+          current_address: addr,
         },
       });
-      return data;
+      if (!data) return null;
+
+      const raw = data.currentUser;
+      const currentUser = raw ? {
+        rank: parseInt(raw.rank) || 0,
+        score: String(raw.score ?? '0'),
+        volume: String(raw.volume ?? '0'),
+        volume24h: String(raw.volume24h ?? raw.volume_24h ?? '0'),
+        boostedVolume: raw.boostedVolume != null ? String(raw.boostedVolume) : undefined,
+        pnl: String(raw.pnl ?? '0'),
+        realizedPnl: String(raw.realizedPnl ?? raw.realized_pnl ?? '0'),
+        referralVolume: String(raw.referralVolume ?? raw.referral_volume ?? '0'),
+        superBoostStatus: raw.superBoostStatus ?? raw.super_boost_status ?? undefined,
+        streak: raw.streak || undefined,
+        lottery: raw.lottery || undefined,
+      } : null;
+
+      const subRankings: SubRankings = {};
+      if (data.currentUserSubRankingTaker) {
+        subRankings.taker = {
+          rank: parseInt(data.currentUserSubRankingTaker.rank) || 0,
+          volume: String(data.currentUserSubRankingTaker.volume ?? '0'),
+          score: String(data.currentUserSubRankingTaker.score ?? '0'),
+        };
+      }
+      if (data.currentUserSubRankingMaker) {
+        subRankings.maker = {
+          rank: parseInt(data.currentUserSubRankingMaker.rank) || 0,
+          volume: String(data.currentUserSubRankingMaker.volume ?? '0'),
+          score: String(data.currentUserSubRankingMaker.score ?? '0'),
+        };
+      }
+      if (data.currentUserSubRankingPnl) {
+        subRankings.pnl = {
+          rank: parseInt(data.currentUserSubRankingPnl.rank) || 0,
+          pnl: String(data.currentUserSubRankingPnl.realizedPnl ?? data.currentUserSubRankingPnl.pnl ?? data.currentUserSubRankingPnl.score ?? '0'),
+          score: String(data.currentUserSubRankingPnl.score ?? '0'),
+        };
+      }
+      if (data.currentUserDailyRace) {
+        subRankings.lottery = {
+          rank: parseInt(data.currentUserDailyRace.rank) || 0,
+          tickets: data.currentUserDailyRace.dailyTicketsEarned ?? data.currentUserDailyRace.tickets ?? 0,
+          wins: data.currentUserDailyRace.wins ?? 0,
+        };
+      }
+
+      // Parse prize pool
+      let prizePool: PrizePool | undefined;
+      if (data.prizePool?.milestones) {
+        prizePool = {
+          milestones: data.prizePool.milestones.map((m: any) => ({
+            targetVolume: String(m.targetVolume ?? '0'),
+            rewardPool: String(m.rewardPool ?? '0'),
+          })),
+          activeMilestone: {
+            targetVolume: String(data.prizePool.activeMilestone?.targetVolume ?? '0'),
+            rewardPool: String(data.prizePool.activeMilestone?.rewardPool ?? '0'),
+          },
+        };
+      }
+
+      return {
+        title: data.title || '',
+        currentUser,
+        subRankings: Object.keys(subRankings).length > 0 ? subRankings : undefined,
+        totalTraders: parseInt(data.totalTraders) || 0,
+        totalVolume: String(data.totalVolume ?? '0'),
+        prizePool,
+        marketBoosts: data.marketBoosts || undefined,
+        streakConfig: data.streakConfig || undefined,
+      };
     } catch {
       return null;
     }

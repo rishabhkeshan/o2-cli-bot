@@ -1,0 +1,42 @@
+{
+  "marketId": "default",
+  "name": "Competition Mode",
+  "orderConfig": {
+    "orderType": "Market",
+    "priceMode": "offsetFromMid",
+    "priceOffsetPercent": 0.02,
+    "maxSpreadPercent": 5,
+    "side": "Both",
+    "priceRandomizationEnabled": true,
+    "priceRandomizationRangePercent": 0.01
+  },
+  "positionSizing": {
+    "sizeMode": "percentageOfBalance",
+    "balancePercentage": 100,
+    "baseBalancePercentage": 45,
+    "quoteBalancePercentage": 45,
+    "minOrderSizeUsd": 5
+  },
+  "orderManagement": {
+    "trackFillPrices": true,
+    "onlySellAboveBuyPrice": false,
+    "maxOpenOrders": 3
+  },
+  "riskManagement": {
+    "takeProfitPercent": 0,
+    "stopLossEnabled": false,
+    "stopLossPercent": 5,
+    "orderTimeoutEnabled": false,
+    "orderTimeoutMinutes": 30,
+    "maxSessionLossEnabled": true,
+    "maxSessionLossUsd": 50
+  },
+  "timing": {
+    "cycleIntervalMinMs": 1500,
+    "cycleIntervalMaxMs": 3000
+  },
+  "consoleMode": "simple",
+  "isActive": true,
+  "createdAt": 1772518776908,
+  "updatedAt": 1772518776908
+}

@@ -4,6 +4,7 @@ import type { StrategyConfig, StrategyExecutionResult } from '../types/strategy.
 import type { MarketDataService } from './market-data.js';
 import type { BalanceTracker } from './balance-tracker.js';
 import type { OrderManager } from './order-manager.js';
+import type { CompetitionTracker } from './competition-tracker.js';
 import { StrategyExecutor } from './strategy-executor.js';
 import * as dbQueries from '../db/queries.js';
 
@@ -32,6 +33,7 @@ export class TradingEngine extends EventEmitter {
   private balanceTracker: BalanceTracker;
   private orderManager: OrderManager;
   private executor: StrategyExecutor;
+  private competitionTracker?: CompetitionTracker;
   private schedules: Map<string, MarketSchedule> = new Map();
   private running = false;
   private schedulerTimer: ReturnType<typeof setTimeout> | null = null;
@@ -46,6 +48,10 @@ export class TradingEngine extends EventEmitter {
     this.balanceTracker = balanceTracker;
     this.orderManager = orderManager;
     this.executor = new StrategyExecutor(orderManager, marketData, balanceTracker);
+  }
+
+  setCompetitionTracker(tracker: CompetitionTracker): void {
+    this.competitionTracker = tracker;
   }
 
   addMarket(market: Market, config: StrategyConfig): void {
@@ -178,22 +184,49 @@ export class TradingEngine extends EventEmitter {
 
       const result = await this.executor.execute(schedule.market, schedule.config);
       schedule.lastResult = result;
-      schedule.nextRunAt = result.nextRunAt || this.calculateNextRun(schedule.config);
+      schedule.nextRunAt = result.nextRunAt || this.calculateNextRun(schedule.config, marketId);
 
       this.emit('cycle', marketId, result);
     } catch (err: any) {
       this.emit('error', marketId, err);
       // Use normal cycle interval — no artificial delay on error
-      schedule.nextRunAt = this.calculateNextRun(schedule.config);
+      schedule.nextRunAt = this.calculateNextRun(schedule.config, marketId);
     }
 
     this.scheduleNext();
   }
 
-  private calculateNextRun(config: StrategyConfig): number {
+  private calculateNextRun(config: StrategyConfig, marketId?: string): number {
     const min = config.timing.cycleIntervalMinMs;
     const max = config.timing.cycleIntervalMaxMs;
-    return Date.now() + min + Math.random() * (max - min);
+    let interval = min + Math.random() * (max - min);
+
+    if (this.competitionTracker && marketId) {
+      // Boost factor: 10000 bp = 1.0x, 15000 bp = 1.5x
+      const market = this.marketData.getMarket(marketId);
+      const contractId = market?.contract_id ?? marketId;
+      const boostBp = this.competitionTracker.getBoostForMarket(contractId);
+      if (boostBp > 10000) {
+        const boostMultiplier = boostBp / 10000;
+        interval = interval / boostMultiplier;
+      }
+
+      // Streak urgency: reduce interval when behind on daily target
+      const streak = this.competitionTracker.getStreakInfo();
+      if (streak?.currentPeriodProgress && !streak.currentPeriodProgress.met) {
+        const volNum = parseFloat(streak.currentPeriodProgress.volume) || 0;
+        const tgtNum = parseFloat(streak.currentPeriodProgress.target) || 0;
+        if (tgtNum > 0) {
+          const pctDone = volNum / tgtNum;
+          if (pctDone < 0.7) {
+            const urgency = Math.max(0.5, 1.0 - (1.0 - pctDone) * 0.5);
+            interval = interval * urgency;
+          }
+        }
+      }
+    }
+
+    return Date.now() + Math.max(interval, 500);
   }
 
   async cancelAllOrders(): Promise<void> {

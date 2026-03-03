@@ -16,6 +16,7 @@ import { BalanceTracker } from './engine/balance-tracker.js';
 import { OrderManager } from './engine/order-manager.js';
 import { TradingEngine } from './engine/trading-engine.js';
 import { PnLCalculator } from './engine/pnl-calculator.js';
+import { CompetitionTracker } from './engine/competition-tracker.js';
 import { NotificationManager } from './notifications/index.js';
 import { Dashboard } from './tui/dashboard.js';
 import { Logger } from './tui/logger.js';
@@ -37,6 +38,7 @@ program
   .description('Start the trading bot')
   .option('-s, --strategy <name>', 'Strategy preset or JSON file name', 'simple')
   .option('-m, --market <pairs...>', 'Market pairs to trade (e.g., ETH_USDC)', ['ETH_USDC'])
+  .option('-w, --watch', 'Monitor only — show dashboard without executing trades')
   .option('--no-tui', 'Disable TUI dashboard (console logging only)')
   .option('--password <password>', 'Session encryption password (skips prompt)')
   .option('--config <path>', 'Path to a strategy JSON config file')
@@ -165,6 +167,7 @@ async function startBot(opts: {
   strategy: string;
   market: string[];
   tui: boolean;
+  watch?: boolean;
   password?: string;
   config?: string;
 }): Promise<void> {
@@ -353,15 +356,33 @@ async function startBot(opts: {
   balanceTracker.init(sessionManager.tradeAccount, walletManager.ownerAddress, requestedMarkets);
   balanceTracker.startPolling();
 
+  // Initialize competition tracker
+  const competitionTracker = new CompetitionTracker(restClient);
+  competitionTracker.init(walletManager.ownerAddress);
+  competitionTracker.startPolling(60_000);
+
+  competitionTracker.on('streakAtRisk', (info: any) => {
+    logger.warn(`Streak at risk! Day ${info.periodIndex + 1}, ${info.progress}% elapsed, ${info.volume}/${info.target} volume`, 'Competition');
+  });
+  competitionTracker.on('superBoostLost', (info: any) => {
+    logger.warn(`Super boost lost! Previous status: ${info.previousStatus}`, 'Competition');
+  });
+
   // Initialize order manager
   const orderManager = new OrderManager(sessionManager, restClient, wsClient);
   orderManager.subscribeOrders();
   await orderManager.seedFillTracker(requestedMarkets);
   orderManager.startPolling(requestedMarkets);
 
-  // Subscribe to depth for all markets
+  // Subscribe to depth for all markets (WS + REST fallback)
   marketData.subscribeDepth(requestedMarkets.map((m) => m.market_id));
   marketData.startTickerPolling(requestedMarkets.map((m) => m.market_id));
+  marketData.startDepthPolling(requestedMarkets.map((m) => m.market_id), 3000);
+
+  // Log unknown WS actions to help diagnose depth issues
+  marketData.on('ws_debug', (msg: string) => {
+    logger.info(msg, 'WS');
+  });
 
   // Initialize P&L calculator
   const pnlCalc = new PnLCalculator();
@@ -382,6 +403,7 @@ async function startBot(opts: {
 
   // Initialize trading engine
   const engine = new TradingEngine(marketData, balanceTracker, orderManager);
+  engine.setCompetitionTracker(competitionTracker);
 
   // Load strategies for each market
   for (const market of requestedMarkets) {
@@ -440,11 +462,16 @@ async function startBot(opts: {
       const priceHuman = fill.price / 10 ** market.quote.decimals;
       const sizeHuman = fill.sizeBase / 10 ** market.base.decimals;
       const pair = `${market.base.symbol}/${market.quote.symbol}`;
-      logger.info(`FILLED ${fill.side} ${sizeHuman.toFixed(6)} ${market.base.symbol} @ $${priceHuman.toFixed(4)} (${pair})`, 'Fill');
+      logger.info(`${fill.side} ${sizeHuman.toFixed(6)} ${market.base.symbol} @ $${priceHuman.toFixed(4)} (${pair})`, 'Fill');
       notifications.notify(
         'ORDER_FILLED',
         `${fill.side} ${sizeHuman.toFixed(6)} ${market.base.symbol} @ $${priceHuman.toFixed(4)}`
       );
+    }
+    // Refresh competition data on fills (debounced: only if last fetch > 30s ago)
+    const compState = competitionTracker.getState();
+    if (!compState || Date.now() - compState.lastUpdated > 30_000) {
+      competitionTracker.refresh().catch(() => {});
     }
   });
 
@@ -484,7 +511,9 @@ async function startBot(opts: {
     wsClient,
     orderManager,
     logger,
+    competitionTracker,
     noTui: !opts.tui,
+    watchMode: opts.watch || false,
     onQuit: () => shutdown(),
     markets: requestedMarkets,
     ownerAddress: walletManager.ownerAddress,
@@ -525,6 +554,7 @@ async function startBot(opts: {
     // Cleanup
     orderManager.shutdown();
     balanceTracker.shutdown();
+    competitionTracker.shutdown();
     marketData.shutdown();
     pnlCalc.shutdown();
     wsClient.disconnect();
@@ -565,11 +595,14 @@ async function startBot(opts: {
   // Start dashboard
   dashboard.start();
 
-  // Start trading!
-  logger.info('Starting trading engine...', 'Boot');
-  engine.start();
-
-  logger.info('Bot is running. Press q to quit, p to pause/resume.', 'Boot');
+  // Start trading (unless watch mode)
+  if (opts.watch) {
+    logger.info('Watch mode — dashboard only, no trading. Press [p] to start trading.', 'Boot');
+  } else {
+    logger.info('Starting trading engine...', 'Boot');
+    engine.start();
+    logger.info('Bot is running. Press q to quit, p to pause/resume.', 'Boot');
+  }
 }
 
 // ─── List Markets ──────────────────────────────────────────

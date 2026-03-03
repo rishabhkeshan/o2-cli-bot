@@ -70,15 +70,19 @@ export class O2WebSocketClient extends EventEmitter {
   }
 
   private handleMessage(msg: WsMessage): void {
-    if (!msg.action) return;
+    const action = msg.action || '';
 
-    switch (msg.action) {
+    switch (action) {
       case 'subscribe_depth_view':
+      case 'depth_view':
         if (msg.view) {
+          // Handle both tuple [price, qty] and object {price, quantity} formats
+          const parseSide = (entries: any[]) =>
+            entries.map((e: any) => Array.isArray(e) ? e : [e.price, e.quantity]);
           this.emit('depth', {
             marketId: msg.market_id,
-            bids: msg.view.buys?.map((b: any) => [b.price, b.quantity]) || [],
-            asks: msg.view.sells?.map((a: any) => [a.price, a.quantity]) || [],
+            bids: msg.view.buys ? parseSide(msg.view.buys) : [],
+            asks: msg.view.sells ? parseSide(msg.view.sells) : [],
           });
         }
         break;
@@ -100,14 +104,37 @@ export class O2WebSocketClient extends EventEmitter {
       case 'ping':
         // Pong received
         break;
+      default: {
+        // Fallback: if any message has a depth view, emit it
+        if (msg.view && (msg.view.buys || msg.view.sells)) {
+          const parseSide = (entries: any[]) =>
+            entries.map((e: any) => Array.isArray(e) ? e : [e.price, e.quantity]);
+          this.emit('depth', {
+            marketId: msg.market_id,
+            bids: msg.view.buys ? parseSide(msg.view.buys) : [],
+            asks: msg.view.sells ? parseSide(msg.view.sells) : [],
+          });
+        }
+        // Emit for diagnostics — dashboard can show which actions arrive
+        if (action) {
+          this.emit('ws_action', action);
+        }
+        break;
+      }
     }
   }
 
   // Subscription methods
-  subscribeDepth(marketIds: string[], precision = 100, frequency = '500ms'): void {
-    const payload = { action: 'subscribe_depth_view', market_ids: marketIds, precision, frequency };
-    this.addSubscription('depth', payload);
-    this.send(payload);
+  subscribeDepth(marketIds: string[], precision = '100', frequency = '500ms'): void {
+    // API requires one subscription per market, market_id (singular), precision as string
+    const payloads = marketIds.map(id => ({
+      action: 'subscribe_depth_view',
+      market_id: id,
+      precision,
+      frequency,
+    }));
+    this.addSubscription('depth', payloads);
+    for (const p of payloads) this.send(p);
   }
 
   subscribeOrders(identities: Identity[]): void {
@@ -128,10 +155,14 @@ export class O2WebSocketClient extends EventEmitter {
     this.send(payload);
   }
 
-  private addSubscription(action: string, payload: any): void {
-    // Remove existing subscription of same type
+  private addSubscription(action: string, payload: any | any[]): void {
+    // Remove existing subscriptions of same type
     this.subscriptions = this.subscriptions.filter((s) => s.action !== action);
-    this.subscriptions.push({ action, payload });
+    // Support single payload or array of payloads
+    const payloads = Array.isArray(payload) ? payload : [payload];
+    for (const p of payloads) {
+      this.subscriptions.push({ action, payload: p });
+    }
   }
 
   private send(payload: any): void {

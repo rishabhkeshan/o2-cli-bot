@@ -182,12 +182,13 @@ export function getDefaultStrategyConfig(marketId: string): StrategyConfig {
 // ============================================
 // STRATEGY PRESETS
 // ============================================
-export type StrategyPreset = 'simple' | 'volumeMaximizing' | 'profitTaking' | 'custom';
+export type StrategyPreset = 'simple' | 'volumeMaximizing' | 'profitTaking' | 'competitionMode' | 'custom';
 
 export const STRATEGY_PRESET_LABELS: Record<StrategyPreset, string> = {
   simple: 'Simple',
   volumeMaximizing: 'Volume Max',
   profitTaking: 'Profit Taking',
+  competitionMode: 'Competition',
   custom: 'Custom',
 };
 
@@ -195,6 +196,7 @@ export const STRATEGY_PRESET_DESCRIPTIONS: Record<StrategyPreset, string> = {
   simple: 'Balanced trading with profit protection',
   volumeMaximizing: 'Maximum volume, P&L not priority',
   profitTaking: 'Ensures 0.1%+ profit per trade',
+  competitionMode: 'Optimized for competition volume + streak targets',
   custom: 'Full control over all settings',
 };
 
@@ -263,6 +265,42 @@ export function getPresetStrategyConfig(marketId: string, preset: StrategyPreset
         timing: {
           cycleIntervalMinMs: 4000,
           cycleIntervalMaxMs: 7000,
+        },
+      };
+
+    case 'competitionMode':
+      return {
+        ...base,
+        name: 'Competition Mode',
+        orderConfig: {
+          ...base.orderConfig,
+          orderType: 'Market',
+          priceMode: 'offsetFromMid',
+          priceOffsetPercent: 0.02,
+          maxSpreadPercent: 5.0,
+          priceRandomizationEnabled: true,
+          priceRandomizationRangePercent: 0.01,
+        },
+        positionSizing: {
+          ...base.positionSizing,
+          sizeMode: 'percentageOfBalance',
+          baseBalancePercentage: 45,
+          quoteBalancePercentage: 45,
+        },
+        orderManagement: {
+          ...base.orderManagement,
+          onlySellAboveBuyPrice: false,
+          maxOpenOrders: 3,
+        },
+        riskManagement: {
+          ...base.riskManagement,
+          takeProfitPercent: 0,
+          maxSessionLossEnabled: true,
+          maxSessionLossUsd: 50,
+        },
+        timing: {
+          cycleIntervalMinMs: 1500,
+          cycleIntervalMaxMs: 3000,
         },
       };
 

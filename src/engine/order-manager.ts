@@ -208,10 +208,8 @@ export class OrderManager extends EventEmitter {
         String(cumulativeFilledQty)
       );
 
-      // Remove fully filled orders from tracker to prevent memory leak
-      if (isFilled) {
-        this.previousFilledQty.delete(order.order_id);
-      }
+      // Keep fully filled orders in tracker to prevent re-emission on next poll.
+      // The 500-entry cap below handles memory.
     }
 
     // Cap tracker size: evict oldest entries if it grows too large

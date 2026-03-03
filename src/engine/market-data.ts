@@ -11,6 +11,8 @@ export class MarketDataService extends EventEmitter {
   private tickers: Map<string, MarketTicker> = new Map();
   private orderBooks: Map<string, OrderBookDepth> = new Map();
   private tickerPollInterval: ReturnType<typeof setInterval> | null = null;
+  private depthPollInterval: ReturnType<typeof setInterval> | null = null;
+  wsDepthCount = 0;  // public diagnostic counter
 
   constructor(restClient: O2RestClient, wsClient: O2WebSocketClient) {
     super();
@@ -27,7 +29,13 @@ export class MarketDataService extends EventEmitter {
         timestamp: Date.now(),
       };
       this.orderBooks.set(data.marketId, book);
+      this.wsDepthCount++;
       this.emit('depth', data.marketId, book);
+    });
+
+    // Log unknown WS actions for diagnostics
+    this.wsClient.on('ws_action', (action: string) => {
+      this.emit('ws_debug', `Unknown WS action: ${action}`);
     });
   }
 
@@ -63,6 +71,16 @@ export class MarketDataService extends EventEmitter {
   getMarketBySymbol(baseSymbol: string, quoteSymbol: string): Market | undefined {
     for (const market of this.markets.values()) {
       if (market.base.symbol === baseSymbol && market.quote.symbol === quoteSymbol) {
+        return market;
+      }
+    }
+    return undefined;
+  }
+
+  getMarketByContractId(contractId: string): Market | undefined {
+    const lower = contractId.toLowerCase();
+    for (const market of this.markets.values()) {
+      if (market.contract_id.toLowerCase() === lower) {
         return market;
       }
     }
@@ -146,13 +164,47 @@ export class MarketDataService extends EventEmitter {
   }
 
   // Start periodic ticker polling for active markets
+  // Also refreshes orderbook depth via REST if WS data is stale
   startTickerPolling(marketIds: string[], intervalMs = 5000): void {
     this.stopTickerPolling();
     this.tickerPollInterval = setInterval(async () => {
       for (const id of marketIds) {
         await this.getTicker(id).catch(() => {});
+        // Refresh orderbook via REST if WS data is stale (>5s old)
+        const cached = this.orderBooks.get(id);
+        if (!cached || !cached.timestamp || Date.now() - cached.timestamp > 5000) {
+          const book = await this.restClient.getDepth(id).catch(() => null);
+          if (book) {
+            this.orderBooks.set(id, { ...book, timestamp: Date.now() });
+            this.emit('depth', id, { ...book, timestamp: Date.now() });
+          }
+        }
       }
     }, intervalMs);
+  }
+
+  // Start dedicated depth REST polling (fallback when WS depth is stale)
+  startDepthPolling(marketIds: string[], intervalMs = 3000): void {
+    this.stopDepthPolling();
+    this.depthPollInterval = setInterval(async () => {
+      for (const id of marketIds) {
+        const cached = this.orderBooks.get(id);
+        // Only fetch via REST if WS data is stale (>3s old)
+        if (!cached || !cached.timestamp || Date.now() - cached.timestamp > 3000) {
+          const book = await this.restClient.getDepth(id).catch(() => null);
+          if (book) {
+            this.orderBooks.set(id, { ...book, timestamp: Date.now() });
+          }
+        }
+      }
+    }, intervalMs);
+  }
+
+  stopDepthPolling(): void {
+    if (this.depthPollInterval) {
+      clearInterval(this.depthPollInterval);
+      this.depthPollInterval = null;
+    }
   }
 
   stopTickerPolling(): void {
@@ -164,5 +216,6 @@ export class MarketDataService extends EventEmitter {
 
   shutdown(): void {
     this.stopTickerPolling();
+    this.stopDepthPolling();
   }
 }
