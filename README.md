@@ -145,19 +145,112 @@ The bot ships with a full-screen terminal dashboard showing real-time data.
 
 ### Keyboard Shortcuts
 
+**Navigation & view**
+
 | Key | Action |
 |-----|--------|
 | `q` / `Ctrl+C` | Quit (graceful shutdown) |
-| `p` | Pause / resume trading |
-| `[` | Previous market |
+| `[` | Previous market (chart focus only) |
 | `]` | Next market |
 | `r` | Cycle chart timeframe (1m → 5m → 15m → 1h → 4h → 1d) |
+| `h` | Toggle activity log / trade history |
+| `?` | Open help overlay |
 
-When trading multiple markets, the header shows your position like `(1/3)`.
+**Engine control**
+
+| Key | Action |
+|-----|--------|
+| `p` | Pause / resume the **whole engine** |
+| `P` | Pause / resume **only the focused market** |
+
+**Strategy control**
+
+| Key | Action |
+|-----|--------|
+| `s` | Cycle strategy preset across **all markets** (legacy quick-cycle) |
+| `S` | Open strategy **picker modal** for the focused market only |
+| `e` | Open strategy **editor modal** — change individual fields (spread, sizes, intervals, SL/TP, etc.) on the live config without restarting |
+
+**Order control**
+
+| Key | Action |
+|-----|--------|
+| `c` | Cancel all open orders for the focused market (immediate) |
+| `C` | Cancel-all with confirm dialog |
+| `O` | Open per-order cancel picker (list of open orders, pick one) |
+| `o` | Open the order ticket — rich buy/sell form with live balances, fees, slippage, and post-trade preview |
+| `f` | Flatten — confirm, then cancel all + market-sell base balance |
+
+When trading multiple markets, the header shows your position like `(1/3)`. New keys are additive — every key the bot used before still works exactly as it did.
+
+### Order ticket (press `o`)
+
+The manual order modal mirrors the web app's place-order panel:
+
+- **Always-visible**: base + quote balances, mid / bid / ask, spread, maker/taker fees, min order
+- **Side toggle** (Buy / Sell) — `←/→` or `B`/`S`
+- **Order-type toggle** — Limit / Market / PostOnly / IOC / FOK
+- **Price input** with shortcuts: `m` = mid, `b` = bid, `a` = ask, or any number
+- **Quantity input** with shortcuts: `25` / `50` / `75` / `100` / `max` = % of available, or any number (Sell uses base balance, Buy uses `quote / price`)
+- **Live recompute on every keystroke** of: total ($), estimated fee (maker vs taker), estimated slippage (Market only), post-trade balances
+- **Status line** that flips between `Ready`, `Insufficient ETH/USDC`, `Below min order $X`, `PostOnly would cross book`, etc.
+- `Tab` cycles fields → Side, Type, Price, Qty, **Place Order** button. `Enter` from any field submits if the status is Ready.
+
+### Open-orders panel & strategy state
+
+The portfolio panel shows up to 10 open orders with `id6 / side / price / qty / fill% / age / Δmid%`. Below it, a one-line **strategy state strip** prints the live values: `Mode | Spread<= | Off<= | Size | Open<= | TP<= | SL on/off`, plus a `Last skip:` line that surfaces the most recent reason the executor declined to trade (e.g. `spread_exceeded`, `insufficient_balance`, `daily_loss_hit`, `slippage_exceeded`).
+
+A **health strip** in the header shows WS state, reconnect count, and the most recent error (abbreviated).
 
 ### Console Mode
 
 Use `--no-tui` for headless environments (servers, Docker, CI). All events are printed to stdout.
+
+---
+
+## Runtime Control
+
+Most things you used to need a restart for can now be done while the bot is running.
+
+### Hot-reload of strategy JSON
+
+The bot watches your `strategies/` directory. Edit any preset file in your editor, save, and within ~300ms every market currently using that preset is updated in place — runtime state (avg buy price, fill history, daily-loss counters, trailing peak) is preserved.
+
+Markets that started from a custom config (`--config ./my.json`) are intentionally **skipped** by hot-reload to avoid clobbering your live tuning.
+
+### Per-market pause
+
+Press `P` (capital) to pause only the focused market. The global engine and other markets keep running. Press `P` again to resume.
+
+### Auto-pause guards
+
+If a strategy sets either of these, the engine will pause itself when things go wrong:
+
+```jsonc
+"riskManagement": {
+  "autoPauseOnConsecutiveFailures": 3,   // after 3 consecutive order rejections, pause this market
+  "autoPauseOnWsDownSeconds": 60         // after WS down for 60s, globally stop (no auto-resume)
+}
+```
+
+Auto-pause is reported via the activity log, the `AUTO_PAUSED` notification, and the `autoPaused` engine event.
+
+### Telegram commands
+
+If you set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `TELEGRAM_ENABLE_COMMANDS=true`, you can drive the bot from Telegram (the chat IDs in `TELEGRAM_CHAT_ID` are the allowlist — comma-separated for multiple accounts):
+
+| Command | What it does |
+|---------|--------------|
+| `/status` | Engine state + per-market preset, paused flag, last skip reason |
+| `/pause` | Stop the engine globally |
+| `/resume` | Start the engine globally |
+| `/cancel [MARKET]` | Cancel open orders for a market (or all if omitted) |
+| `/flatten [MARKET]` | Cancel orders + market-sell base balance |
+| `/strategy <preset> [MARKET]` | Switch preset (`simple`, `volumeMaximizing`, `profitTaking`, `competitionMode`) |
+| `/markets` | List active markets |
+| `/help` | Print the command list |
+
+Non-allowlisted chats receive a polite "not authorized" reply, and the attempt is logged.
 
 ---
 
@@ -170,6 +263,7 @@ Use `--no-tui` for headless environments (servers, Docker, CI). All events are p
 | `simple` | Balanced | Limit | 2% max | Sell above avg buy | 3-5s |
 | `volumeMaximizing` | Aggressive | Market | 5% max | None | 1-2s |
 | `profitTaking` | Conservative | Limit | 1.5% max | 0.1% min margin | 4-7s |
+| `competitionMode` | Volume race | Market w/ jitter | 5% max | None (45% sizing, $50 session-loss cap) | 1.5-3s |
 
 ### Customizing Strategies
 
@@ -185,7 +279,8 @@ This creates JSON files in `./strategies/`:
 strategies/
 ├── simple.json
 ├── volumeMaximizing.json
-└── profitTaking.json
+├── profitTaking.json
+└── competitionMode.json
 ```
 
 Edit any file, then run with it:
@@ -200,48 +295,111 @@ o2-bot --config ./strategies/my-custom.json
 
 ### Strategy Config Fields
 
+The on-disk JSON is grouped into sections. Every field below is **optional** unless it appears in a preset — defaults preserve the original behavior, so you can copy a preset and only set the fields you care about.
+
 ```jsonc
 {
   "name": "my-strategy",
   "isActive": true,
+  "preferBoostedMarkets": false,           // Schedule boosted markets first (competition)
 
-  // Order placement
-  "orderType": "Spot",                    // "Spot" (limit) or "Market"
-  "priceMode": "offsetFromMid",           // "offsetFromMid", "offsetFromBestBid", "offsetFromBestAsk", "market"
-  "priceOffsetPercent": 0.1,              // % offset from reference price
-  "maxSpreadPercent": 2.0,                // Skip cycle if spread exceeds this
-  "side": "Both",                         // "Buy", "Sell", or "Both"
+  "orderConfig": {
+    // Order type
+    "orderType": "Spot",                   // "Market" | "Spot" | "PostOnly" | "IOC" | "FOK"
+                                           //   IOC is mapped to FillOrKill (the contract has no native IOC)
+    "priceMode": "offsetFromMid",          // "offsetFromMid" | "offsetFromBestBid" | "offsetFromBestAsk" | "market"
+    "priceOffsetPercent": 0.1,             // % offset from reference price
+    "maxSpreadPercent": 2.0,               // Skip cycle if spread exceeds this
+    "side": "Both",                        // "Buy" | "Sell" | "Both"
 
-  // Position sizing
-  "sizeMode": "percentageOfBalance",      // "percentageOfBalance" or "fixedUsd"
-  "baseBalancePercentage": 50,            // % of base balance for sells
-  "quoteBalancePercentage": 50,           // % of quote balance for buys
-  "fixedUsdAmount": 100,                  // Used when sizeMode is "fixedUsd"
-  "minOrderSizeUsd": 5,                   // Minimum order size in USD
-  "maxOrderSizeUsd": 1000,               // Maximum order size in USD (optional)
+    // Price randomization
+    "priceRandomizationEnabled": false,
+    "priceRandomizationRangePercent": 0.01,
 
-  // Risk management
-  "onlySellAboveBuyPrice": true,          // Only sell if price > avg buy price
-  "takeProfitPercent": 0.05,              // Minimum profit margin above fees
-  "stopLossEnabled": false,               // Enable stop-loss
-  "stopLossPercent": 5.0,                 // Sell if price drops this % below avg buy
-  "maxOpenOrders": 2,                     // Max open orders per side
-  "maxSessionLossEnabled": false,         // Pause if session P&L exceeds loss
-  "maxSessionLossUsd": 50,               // Max session loss in USD
+    // Slippage cap on Market orders (estimated VWAP slippage)
+    "slippageMaxPercent": 0.5,             // optional; market orders aborted if estimated > this
 
-  // Order lifecycle
-  "orderTimeoutEnabled": false,           // Cancel unfilled orders after timeout
-  "orderTimeoutMinutes": 15,             // Minutes before cancelling
+    // Auto-replace open orders if reference price has drifted by more than this %
+    "autoReplaceOnDriftPercent": 0.15,     // optional; cancels stale orders so the next cycle re-quotes
 
-  // Timing
-  "cycleIntervalMinMs": 3000,            // Min time between order cycles
-  "cycleIntervalMaxMs": 5000,            // Max time between order cycles
+    // Volatility-adaptive spread (rolling realized vol)
+    "volatilityAdaptiveSpreadEnabled": false,
+    "volatilityLookbackBars": 30,
+    "volatilitySpreadMultiplier": 5,       // offset_effective = offset * (1 + multiplier * realizedVol)
 
-  // Price randomization
-  "priceRandomizationEnabled": false,     // Add random noise to prices
-  "priceRandomizationRangePercent": 0.01  // Range of random noise
+    // Inventory-skewed quoting
+    "inventorySkewEnabled": false,
+    "inventoryTargetBaseRatio": 0.5,       // 0..1, target fraction of equity in base
+    "inventoryMaxSkewPercent": 0.2         // max additional offset added on full imbalance
+  },
+
+  "positionSizing": {
+    "sizeMode": "percentageOfBalance",     // "percentageOfBalance" | "fixedUsd"
+    "baseBalancePercentage": 50,
+    "quoteBalancePercentage": 50,
+    "fixedUsdAmount": 100,                 // used when sizeMode is "fixedUsd"
+    "minOrderSizeUsd": 5,
+    "maxOrderSizeUsd": 1000,               // per-order cap
+    "maxAggregatePositionUsd": 5000        // optional cap across ALL open orders for this market
+  },
+
+  "orderManagement": {
+    "onlySellAboveBuyPrice": true,
+    "maxOpenOrders": 2                     // per side, per market
+  },
+
+  "riskManagement": {
+    "takeProfitPercent": 0.05,             // minimum profit margin above fees
+    "stopLossEnabled": false,
+    "stopLossPercent": 5.0,                // sell if price drops this % below avg buy
+
+    // Trailing stop (in addition to / alternative to fixed stop loss)
+    "trailingStopEnabled": false,
+    "trailingStopPercent": 2,              // exit when price falls this % from the peak
+
+    // Session loss cap (existing)
+    "maxSessionLossEnabled": false,
+    "maxSessionLossUsd": 50,
+
+    // Daily loss cap with UTC reset
+    "maxDailyLossEnabled": false,
+    "maxDailyLossUsd": 50,
+    "dailyLossResetUtcHour": 0,            // 0..23, default 0 (UTC midnight)
+
+    // Order timeout (existing)
+    "orderTimeoutEnabled": false,
+    "orderTimeoutMinutes": 15,
+
+    // Auto-pause guards
+    "autoPauseOnConsecutiveFailures": 3,   // pause this market after N consecutive order rejections
+    "autoPauseOnWsDownSeconds": 60         // globally stop after WS has been down for N seconds (no auto-resume)
+  },
+
+  "timing": {
+    "cycleIntervalMinMs": 3000,
+    "cycleIntervalMaxMs": 5000
+  }
 }
 ```
+
+#### Order types
+
+The strategy-level `orderType` maps to the contract enum as follows:
+
+| Strategy value | Behavior |
+|---|---|
+| `Market` | Crosses the book |
+| `Spot` | Limit, may rest |
+| `Limit` | Same as `Spot` |
+| `PostOnly` | Limit; rejected if it would immediately match |
+| `IOC` | Mapped to `FillOrKill` (no native IOC on the contract) |
+| `FOK` | Fill-or-kill |
+
+#### Skip diagnostics
+
+Every cycle, the executor populates a structured `skipCategory` and a `diagnostics` block on the result so the TUI (and Telegram `/status`) can show *why* the bot is idle. Possible categories:
+
+`spread_exceeded` · `insufficient_balance` · `max_open_orders` · `profit_floor` · `session_loss_hit` · `daily_loss_hit` · `stop_loss_active` · `paused` · `ws_down` · `consecutive_failures` · `aggregate_cap_hit` · `slippage_exceeded` · `cooldown` · `other`
 
 ---
 
@@ -276,22 +434,32 @@ O2_STRATEGIES_DIR=./strategies
 # Notifications (optional)
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
-TELEGRAM_CHAT_ID=123456789
+TELEGRAM_CHAT_ID=123456789                  # comma-separated list = allowlist for inbound commands
+TELEGRAM_ENABLE_COMMANDS=true               # opt-in; turns on /status /pause /resume /cancel /flatten /strategy /markets /help
 ```
 
 ### Notifications
 
-The bot can send real-time alerts to Discord and/or Telegram for:
-- Bot started / stopped
-- Orders filled
-- Stop-loss triggers
-- Errors and warnings
+The bot can send real-time alerts to Discord and/or Telegram. Alert types:
 
-**Discord**: Create a webhook in your Discord server settings, add the URL to `.env`.
+| Type | When |
+|------|------|
+| `BOT_STARTED` / `BOT_STOPPED` | Engine start / stop |
+| `ORDER_FILLED` | A fill is observed |
+| `ORDER_REJECTED` | API rejected an order |
+| `STOP_LOSS_TRIGGERED` | Fixed or trailing stop fired |
+| `DAILY_LOSS_HIT` | Daily-loss cap reached on a market |
+| `WS_DOWN` | WebSocket has been down for >30s |
+| `SESSION_EXPIRING` | Session has <1h left |
+| `SESSION_RECOVERED` | A new session was created after invalidation |
+| `AUTO_PAUSED` | Auto-pause triggered (per-market or global) |
+| `ERROR` | Catch-all for uncategorized errors |
 
-**Telegram**: Create a bot via [@BotFather](https://t.me/BotFather), get the token and your chat ID, add both to `.env`.
+**Discord**: Create a webhook in your Discord server settings, add the URL to `.env`. Webhook only — no inbound commands.
 
-Notifications are rate-limited to 1 alert per type per minute to prevent spam.
+**Telegram**: Create a bot via [@BotFather](https://t.me/BotFather), get the token and your chat ID, add both to `.env`. To control the bot from Telegram (`/pause`, `/strategy`, etc.), also set `TELEGRAM_ENABLE_COMMANDS=true`. Multiple chat IDs (comma-separated in `TELEGRAM_CHAT_ID`) form the command allowlist.
+
+Notifications are rate-limited to 1 alert per type per minute to prevent spam. You can suppress specific alert types per channel via `NotificationManagerOptions.{telegram,discord}.disabledTypes`.
 
 ---
 
@@ -392,19 +560,23 @@ src/
 │   ├── rest-client.ts       # O2 REST API client
 │   └── ws-client.ts         # WebSocket client (order book, orders)
 ├── engine/
-│   ├── trading-engine.ts    # Main trading loop
-│   ├── strategy-executor.ts # Strategy logic execution
-│   ├── order-manager.ts     # Order submission and fill tracking
+│   ├── trading-engine.ts    # Main trading loop, per-market pause, hot-reload, auto-pause monitor
+│   ├── strategy-executor.ts # Strategy logic (vol-adaptive, inventory skew, trailing stop, daily loss…)
+│   ├── order-manager.ts     # Order submission, fill tracking, PostOnly/IOC/FOK wiring
+│   ├── risk-tracker.ts      # Daily-loss windows, mid-price history, consecutive-failure tracker
 │   ├── market-data.ts       # Market data, tickers, order books
 │   ├── balance-tracker.ts   # Balance monitoring
+│   ├── competition-tracker.ts # Competition leaderboard, boosts, streaks
 │   └── pnl-calculator.ts    # P&L computation and snapshots
 ├── tui/
-│   ├── dashboard.ts         # Blessed TUI dashboard
+│   ├── dashboard.ts         # Blessed TUI dashboard, modal hotkeys
+│   ├── modals.ts            # Reusable modals (input, picker, confirm, form, help overlay)
 │   └── logger.ts            # Event logger
 ├── notifications/
-│   ├── index.ts             # Notification manager
+│   ├── index.ts             # Notification manager, typed helpers
+│   ├── command-router.ts    # Telegram inbound command router with allowlist
 │   ├── discord.ts           # Discord webhooks
-│   └── telegram.ts          # Telegram bot messages
+│   └── telegram.ts          # Telegram bot messages (alerts + opt-in command polling)
 ├── db/
 │   ├── index.ts             # SQLite init and auto-save
 │   └── queries.ts           # Database CRUD

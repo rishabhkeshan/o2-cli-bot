@@ -11,9 +11,19 @@ import type { Market, Bar, OrderBookDepth, MarketTicker } from '../types/market.
 import type { Order } from '../types/order.js';
 import type { Logger } from './logger.js';
 import type { CompetitionTracker } from '../engine/competition-tracker.js';
-import type { StrategyPreset } from '../types/strategy.js';
-import { getPresetStrategyConfig, STRATEGY_PRESET_LABELS } from '../types/strategy.js';
+import type { StrategyPreset, StrategyConfig } from '../types/strategy.js';
+import { getPresetStrategyConfig, STRATEGY_PRESET_LABELS, STRATEGY_PRESET_DESCRIPTIONS } from '../types/strategy.js';
 import * as dbQueries from '../db/queries.js';
+import {
+  showPickerModal,
+  showConfirmModal,
+  showFormModal,
+  showOrderEntryModal,
+  type OrderEntryType,
+  showHelpOverlay,
+  type FormField,
+  type HelpSection,
+} from './modals.js';
 
 // Force truecolor output
 chalk.level = 3;
@@ -219,6 +229,16 @@ export class Dashboard {
   // Price history for sparkline
   private priceHistory: number[] = [];
   private readonly MAX_PRICE_HISTORY = 40;
+
+  // Modal/visibility state — depth-counted so nested modals don't release the
+  // hotkey lock prematurely.
+  private modalDepth = 0;
+  private get modalActive(): boolean { return this.modalDepth > 0; }
+  private wsReconnectCount = 0;
+  private lastWsError: string | null = null;
+  // Per-market user-toggled pause (front-end overlay; the engine-level
+  // pause method may not exist yet — see TODO(wave3-wiring))
+  private localPausedMarkets: Set<string> = new Set();
 
   constructor(opts: {
     engine: TradingEngine;
@@ -465,8 +485,12 @@ export class Dashboard {
     this.screen.append(this.historyBox);
 
     // ─── Key bindings ───────────────────────────────────
-    this.screen.key(['q', 'C-c'], () => { if (this.onQuit) this.onQuit(); });
+    // q is suppressed when a modal is open so it can be used to dismiss
+    // the modal. C-c always quits as a hard exit.
+    this.screen.key(['q'], () => { if (this.modalActive) return; if (this.onQuit) this.onQuit(); });
+    this.screen.key(['C-c'], () => { if (this.onQuit) this.onQuit(); });
     this.screen.key(['p'], () => {
+      if (this.modalActive) return;
       if (this.engine.isRunning) { this.engine.stop(); this.addLog('{yellow-fg}Bot paused{/yellow-fg}'); }
       else {
         this.watchMode = false;
@@ -475,6 +499,7 @@ export class Dashboard {
       }
     });
     this.screen.key(['['], () => {
+      if (this.modalActive) return;
       if (this.markets.length > 1) {
         this.currentMarketIndex = (this.currentMarketIndex - 1 + this.markets.length) % this.markets.length;
         this.lastBarFetch = 0;
@@ -483,6 +508,7 @@ export class Dashboard {
       }
     });
     this.screen.key([']'], () => {
+      if (this.modalActive) return;
       if (this.markets.length > 1) {
         this.currentMarketIndex = (this.currentMarketIndex + 1) % this.markets.length;
         this.lastBarFetch = 0;
@@ -491,11 +517,13 @@ export class Dashboard {
       }
     });
     this.screen.key(['r'], () => {
+      if (this.modalActive) return;
       this.resolutionIndex = (this.resolutionIndex + 1) % RESOLUTIONS.length;
       this.lastBarFetch = 0;
       this.addLog(`Chart resolution: ${RESOLUTIONS[this.resolutionIndex]}`);
     });
     this.screen.key(['s'], () => {
+      if (this.modalActive) return;
       this.currentPresetIndex = (this.currentPresetIndex + 1) % STRATEGY_PRESETS.length;
       const preset = STRATEGY_PRESETS[this.currentPresetIndex];
       const label = STRATEGY_PRESET_LABELS[preset];
@@ -506,6 +534,7 @@ export class Dashboard {
       this.addLog(`{cyan-fg}Strategy switched to: ${label}{/cyan-fg}`);
     });
     this.screen.key(['h'], () => {
+      if (this.modalActive) return;
       this.viewMode = this.viewMode === 'log' ? 'history' : 'log';
       if (this.viewMode === 'history') {
         this.logBox?.hide(); this.historyBox?.show();
@@ -516,6 +545,7 @@ export class Dashboard {
       this.screen?.render();
     });
     this.screen.key(['c'], async () => {
+      if (this.modalActive) return;
       const market = this.currentMarket;
       if (!market || !this.orderManager) return;
       this.addLog('{yellow-fg}Cancelling all open orders...{/yellow-fg}');
@@ -525,6 +555,40 @@ export class Dashboard {
       } catch (err: any) {
         this.addLog(`{red-fg}Cancel failed: ${err.message}{/red-fg}`);
       }
+    });
+
+    // ─── New modal-driven keybindings (additive) ──────────
+    this.screen.key(['?'], () => {
+      if (this.modalActive) return;
+      void this.openHelpOverlay();
+    });
+    this.screen.key(['S'], () => {
+      if (this.modalActive) return;
+      void this.openStrategyPicker();
+    });
+    this.screen.key(['e'], () => {
+      if (this.modalActive) return;
+      void this.openStrategyEditor();
+    });
+    this.screen.key(['o'], () => {
+      if (this.modalActive) return;
+      void this.openManualOrderModal();
+    });
+    this.screen.key(['f'], () => {
+      if (this.modalActive) return;
+      void this.openFlattenConfirm();
+    });
+    this.screen.key(['C'], () => {
+      if (this.modalActive) return;
+      void this.openCancelAllConfirm();
+    });
+    this.screen.key(['P'], () => {
+      if (this.modalActive) return;
+      void this.toggleMarketPause();
+    });
+    this.screen.key(['O'], () => {
+      if (this.modalActive) return;
+      void this.openCancelOrderPicker();
     });
 
     // ─── Event handlers ─────────────────────────────────
@@ -558,7 +622,18 @@ export class Dashboard {
     });
     this.engine.on('error', (mId: string, err: Error) => {
       this.addLog(`{red-fg}Error [${mId}]: ${err.message}{/red-fg}`);
+      this.lastWsError = `${mId}: ${err.message}`;
     });
+
+    // ─── WS health tracking ───────────────────────────────
+    if (this.wsClient) {
+      this.wsClient.on('disconnected', () => {
+        this.wsReconnectCount += 1;
+      });
+      this.wsClient.on('error', (err: Error) => {
+        this.lastWsError = err.message;
+      });
+    }
 
     this.loadTapeFromDb();
     this.updateInterval = setInterval(() => this.render(), 1000);
@@ -748,6 +823,21 @@ export class Dashboard {
 
       line2 += `  ${tc(T.dim, VLINE)}  ${tc(T.accent, compTitle)} ${tc(T.gold, `#${u.rank}`)} Vol:${tc(T.fg, `$${this.fmtBigNum(u.volume)}`)} P&L:${tc(pnlColor, `$${this.fmtBigNum(u.pnl)}`)} ${tc(T.dim, timeStr)}${streakStr}`;
     }
+
+    // Append health strip onto line 2 — connection state, reconnect count,
+    // last error abbreviated. Counts come from local tracking; if not
+    // populated they show as `—`.
+    const wsState = this.wsClient
+      ? (this.wsClient.isConnected ? tc(T.buy, 'OK') : tc(T.sell, 'DOWN'))
+      : tc(T.dim, '—');
+    const reconnects = this.wsReconnectCount > 0
+      ? tc(T.warn, String(this.wsReconnectCount))
+      : tc(T.dim, '0');
+    const errStr = this.lastWsError
+      ? tc(T.sell, this.lastWsError.slice(0, 32))
+      : tc(T.dim, '—');
+    const healthStrip = `${tc(T.muted, 'WS:')}${wsState} ${tc(T.muted, 'rc:')}${reconnects} ${tc(T.muted, 'err:')}${errStr}`;
+    line2 += `  ${tc(T.dim, VLINE)}  ${healthStrip}`;
 
     this.headerBox.setContent(line1 + '\n' + line2);
   }
@@ -1341,20 +1431,70 @@ export class Dashboard {
       }
     }
 
-    // Open Orders
+    // Open Orders — detailed table (up to 10) with id/side/price/qty/fill%/age/dist
     if (this.openOrders.length > 0) {
       const qScale = 10 ** market.quote.decimals;
       const bScale = 10 ** market.base.decimals;
       content += `\n${tcB(T.accent, `${TRI} Open Orders (${this.openOrders.length})`)}\n`;
-      for (const o of this.openOrders.slice(0, 5)) {
-        const side = o.side === 'Buy' ? tcB(T.buy, 'BUY') : tcB(T.sell, 'SELL');
-        const price = fmtPrice(parseFloat(o.price) / qScale);
-        const qty = fmtQty(parseFloat(o.quantity) / bScale);
-        content += `  ${side} ${tc(T.fg, qty)} @ ${tc(T.fg, `$${price}`)}\n`;
+      // Header row
+      content += `  ${tc(T.muted, 'ID    ')} ${tc(T.muted, 'Side')} ${tc(T.muted, 'Price'.padStart(10))} ${tc(T.muted, 'Qty'.padStart(8))} ${tc(T.muted, 'Fill%')} ${tc(T.muted, 'Age'.padStart(6))} ${tc(T.muted, 'Δmid%')}\n`;
+      const mid = midPrice;
+      const visible = this.openOrders.slice(0, 10);
+      for (let i = 0; i < visible.length; i++) {
+        const o = visible[i];
+        const idShort = (o.order_id || '').slice(0, 6).padEnd(6);
+        const side = o.side === 'Buy' ? tcB(T.buy, 'BUY ') : tcB(T.sell, 'SELL');
+        const priceN = parseFloat(o.price) / qScale;
+        const qtyN = parseFloat(o.quantity) / bScale;
+        const fillN = parseFloat(o.quantity_fill || '0') / bScale;
+        const fillPct = qtyN > 0 ? Math.min(100, Math.round((fillN / qtyN) * 100)) : 0;
+        const ageMs = Math.max(0, Date.now() - (o.created_at || Date.now()));
+        const ageMin = Math.floor(ageMs / 60000);
+        const ageSec = Math.floor((ageMs % 60000) / 1000);
+        const ageStr = `${ageMin}m${ageSec}s`;
+        const distPct = mid > 0 ? ((priceN - mid) / mid) * 100 : 0;
+        const distStr = `${distPct >= 0 ? '+' : ''}${distPct.toFixed(2)}%`;
+        const rowFg = i % 2 === 0 ? T.fg : T.muted;
+        content += `  ${tc(rowFg, idShort)} ${side} ${tc(rowFg, fmtPrice(priceN).padStart(10))} ${tc(rowFg, fmtQty(qtyN).padStart(8))} ${tc(rowFg, String(fillPct).padStart(4) + '%')} ${tc(rowFg, ageStr.padStart(6))} ${tc(distPct >= 0 ? T.buy : T.sell, distStr.padStart(7))}\n`;
       }
-      if (this.openOrders.length > 5) {
-        content += `  ${tc(T.accent, `+${this.openOrders.length - 5} more`)}\n`;
+      if (this.openOrders.length > 10) {
+        content += `  ${tc(T.accent, `+${this.openOrders.length - 10} more`)}\n`;
       }
+    } else {
+      // Fallback: keep the empty-state line so the panel never collapses
+      content += `\n${tc(T.muted, `${TRI} No open orders`)}\n`;
+    }
+
+    // Strategy state strip — compact summary always rendered
+    const stratCfg = this.engine.getStrategyConfig(mId);
+    if (stratCfg) {
+      const presetName = stratCfg.name || 'Custom';
+      const sl = stratCfg.riskManagement.stopLossEnabled ? 'on' : 'off';
+      const stripParts = [
+        `${tc(T.muted, 'Mode:')} ${tc(T.accent, presetName)}`,
+        `${tc(T.muted, 'Spread<=')} ${tc(T.fg, `${stratCfg.orderConfig.maxSpreadPercent}%`)}`,
+        `${tc(T.muted, 'Off<=')} ${tc(T.fg, `${stratCfg.orderConfig.priceOffsetPercent}%`)}`,
+        `${tc(T.muted, 'Size:')} ${tc(T.fg, `${stratCfg.positionSizing.quoteBalancePercentage}%Q/${stratCfg.positionSizing.baseBalancePercentage}%B`)}`,
+        `${tc(T.muted, 'Open<=')} ${tc(T.fg, String(stratCfg.orderManagement.maxOpenOrders))}`,
+        `${tc(T.muted, 'TP<=')} ${tc(T.fg, `${stratCfg.riskManagement.takeProfitPercent}%`)}`,
+        `${tc(T.muted, 'SL:')} ${tc(stratCfg.riskManagement.stopLossEnabled ? T.warn : T.dim, sl)}`,
+      ];
+      content += `\n${tcB(T.accent, `${TRI} State`)}\n  ${stripParts.join(tc(T.dim, ' | '))}\n`;
+
+      // Last skip — pull from engine.getLastExecutionResult if available.
+      // TODO(wave3-wiring): typed once engine wave lands
+      const lastResult = (this.engine as any).getLastExecutionResult?.(mId) as
+        | { skipReason?: string; skipCategory?: string }
+        | undefined;
+      if (lastResult?.skipReason) {
+        const cat = lastResult.skipCategory || 'other';
+        content += `  ${tc(T.muted, 'Last skip:')} ${tc(T.warn, cat)} ${tc(T.dim, lastResult.skipReason.slice(0, 60))}\n`;
+      }
+    }
+
+    // Local pause overlay indicator
+    if (this.localPausedMarkets.has(mId)) {
+      content += `  ${tc(T.warn, '⏸ Market paused (local)')}\n`;
     }
 
     this.balancePnlBox.setContent(content);
@@ -1491,6 +1631,414 @@ export class Dashboard {
     const m = Math.floor(s / 60);
     const h = Math.floor(m / 60);
     return `${h}h ${m % 60}m ${s % 60}s`;
+  }
+
+  // ─── Modal handlers ───────────────────────────────────
+  private async withModal<T>(fn: () => Promise<T>): Promise<T | undefined> {
+    if (!this.screen) return undefined;
+    this.modalDepth += 1;
+    try {
+      return await fn();
+    } finally {
+      this.modalDepth = Math.max(0, this.modalDepth - 1);
+      this.screen?.render();
+    }
+  }
+
+  private async openHelpOverlay(): Promise<void> {
+    if (!this.screen) return;
+    const sections: HelpSection[] = [
+      {
+        title: 'Navigation',
+        entries: [
+          { key: '[', description: 'Previous market' },
+          { key: ']', description: 'Next market' },
+          { key: 'r', description: 'Cycle chart resolution' },
+          { key: 'h', description: 'Toggle Activity ↔ Trade History' },
+        ],
+      },
+      {
+        title: 'Trading',
+        entries: [
+          { key: 's', description: 'Cycle preset (all markets)' },
+          { key: 'S', description: 'Strategy picker (current market)' },
+          { key: 'e', description: 'Edit strategy parameters' },
+          { key: 'o', description: 'Place manual order' },
+          { key: 'c', description: 'Cancel all orders (immediate)' },
+          { key: 'C', description: 'Cancel all orders (confirm)' },
+          { key: 'O', description: 'Cancel a single order (picker)' },
+          { key: 'f', description: 'Flatten position (cancel + sell)' },
+        ],
+      },
+      {
+        title: 'View',
+        entries: [
+          { key: '?', description: 'This help overlay' },
+        ],
+      },
+      {
+        title: 'System',
+        entries: [
+          { key: 'p', description: 'Pause / resume bot (global)' },
+          { key: 'P', description: 'Pause / resume current market only' },
+          { key: 'q', description: 'Quit' },
+          { key: 'Ctrl-C', description: 'Quit' },
+        ],
+      },
+    ];
+    await this.withModal(() => showHelpOverlay(this.screen!, sections));
+  }
+
+  private async openStrategyPicker(): Promise<void> {
+    if (!this.screen) return;
+    const market = this.currentMarket;
+    if (!market) return;
+
+    const items = STRATEGY_PRESETS.map((p) => ({
+      label: STRATEGY_PRESET_LABELS[p],
+      value: p,
+      hint: STRATEGY_PRESET_DESCRIPTIONS[p],
+    }));
+    const currentIdx = this.currentPresetIndex;
+    const picked = await this.withModal(() =>
+      showPickerModal<StrategyPreset>(this.screen!, {
+        title: `Strategy preset — ${market.base.symbol}/${market.quote.symbol}`,
+        items,
+        initialIndex: currentIdx,
+      })
+    );
+    if (!picked) return;
+
+    // TODO(wave3-wiring): typed once engine wave lands
+    const setPreset = (this.engine as any).setStrategyPreset as
+      | ((preset: StrategyPreset, marketId?: string) => void)
+      | undefined;
+    if (typeof setPreset === 'function') {
+      setPreset.call(this.engine, picked, market.market_id);
+    } else {
+      const newConfig = getPresetStrategyConfig(market.market_id, picked);
+      this.engine.updateConfig(market.market_id, newConfig);
+    }
+    this.addLog(`{cyan-fg}Strategy switched to: ${STRATEGY_PRESET_LABELS[picked]} for ${market.base.symbol}/${market.quote.symbol}{/cyan-fg}`);
+  }
+
+  private async openStrategyEditor(): Promise<void> {
+    if (!this.screen) return;
+    const market = this.currentMarket;
+    if (!market) return;
+    const cfg = this.engine.getStrategyConfig(market.market_id);
+    if (!cfg) {
+      this.addLog('{yellow-fg}No strategy config available for editing.{/yellow-fg}');
+      return;
+    }
+
+    const fields: Array<FormField<string>> = [
+      { key: 'priceOffsetPercent', label: 'Price offset %', initial: String(cfg.orderConfig.priceOffsetPercent ?? 0), type: 'number', helper: 'e.g. 0.05' },
+      { key: 'maxSpreadPercent', label: 'Max spread %', initial: String(cfg.orderConfig.maxSpreadPercent ?? 0), type: 'number', helper: '0–100' },
+      { key: 'baseBalancePercentage', label: 'Base balance %', initial: String(cfg.positionSizing.baseBalancePercentage ?? 100), type: 'number', helper: '0–100' },
+      { key: 'quoteBalancePercentage', label: 'Quote balance %', initial: String(cfg.positionSizing.quoteBalancePercentage ?? 100), type: 'number', helper: '0–100' },
+      { key: 'minOrderSizeUsd', label: 'Min order size USD', initial: String(cfg.positionSizing.minOrderSizeUsd ?? 5), type: 'number' },
+      { key: 'maxOrderSizeUsd', label: 'Max order size USD', initial: cfg.positionSizing.maxOrderSizeUsd != null ? String(cfg.positionSizing.maxOrderSizeUsd) : '', type: 'number', helper: 'blank = no cap' },
+      { key: 'maxOpenOrders', label: 'Max open orders', initial: String(cfg.orderManagement.maxOpenOrders ?? 2), type: 'number' },
+      { key: 'takeProfitPercent', label: 'Take profit %', initial: String(cfg.riskManagement.takeProfitPercent ?? 0), type: 'number' },
+    ];
+    if (cfg.riskManagement.stopLossEnabled) {
+      fields.push({ key: 'stopLossPercent', label: 'Stop loss %', initial: String(cfg.riskManagement.stopLossPercent ?? 0), type: 'number' });
+    }
+    fields.push(
+      { key: 'cycleIntervalMinMs', label: 'Cycle interval min ms', initial: String(cfg.timing.cycleIntervalMinMs ?? 3000), type: 'number' },
+      { key: 'cycleIntervalMaxMs', label: 'Cycle interval max ms', initial: String(cfg.timing.cycleIntervalMaxMs ?? 5000), type: 'number' },
+    );
+
+    const validate = (values: Record<string, string>): string | null => {
+      const numKeys = ['priceOffsetPercent', 'maxSpreadPercent', 'baseBalancePercentage', 'quoteBalancePercentage', 'minOrderSizeUsd', 'maxOpenOrders', 'takeProfitPercent', 'stopLossPercent', 'cycleIntervalMinMs', 'cycleIntervalMaxMs'];
+      for (const k of numKeys) {
+        if (!(k in values)) continue;
+        const raw = values[k];
+        if (raw === '' || raw === undefined) continue;
+        const n = Number(raw);
+        if (!isFinite(n)) return `${k}: not a number`;
+        if (n < 0) return `${k}: must be >= 0`;
+      }
+      const pctKeys = ['maxSpreadPercent', 'baseBalancePercentage', 'quoteBalancePercentage', 'takeProfitPercent', 'stopLossPercent'];
+      for (const k of pctKeys) {
+        if (!(k in values)) continue;
+        const raw = values[k];
+        if (raw === '' || raw === undefined) continue;
+        const n = Number(raw);
+        if (n < 0 || n > 100) return `${k}: must be 0–100`;
+      }
+      // size > 0 sanity check on min order size and intervals
+      const min = Number(values.cycleIntervalMinMs);
+      const max = Number(values.cycleIntervalMaxMs);
+      if (isFinite(min) && isFinite(max) && max < min) return 'cycleIntervalMaxMs must be >= cycleIntervalMinMs';
+      const minSize = Number(values.minOrderSizeUsd);
+      if (isFinite(minSize) && minSize <= 0) return 'minOrderSizeUsd: must be > 0';
+      return null;
+    };
+
+    const result = await this.withModal(() =>
+      showFormModal<Record<string, string>>(this.screen!, {
+        title: `Edit strategy — ${market.base.symbol}/${market.quote.symbol}`,
+        fields,
+        validate,
+      })
+    );
+    if (!result) return;
+
+    // Build new config preserving runtime state and unmodified fields
+    const newCfg: StrategyConfig = {
+      ...cfg,
+      orderConfig: {
+        ...cfg.orderConfig,
+        priceOffsetPercent: Number(result.priceOffsetPercent),
+        maxSpreadPercent: Number(result.maxSpreadPercent),
+      },
+      positionSizing: {
+        ...cfg.positionSizing,
+        baseBalancePercentage: Number(result.baseBalancePercentage),
+        quoteBalancePercentage: Number(result.quoteBalancePercentage),
+        minOrderSizeUsd: Number(result.minOrderSizeUsd),
+        maxOrderSizeUsd: result.maxOrderSizeUsd === '' ? undefined : Number(result.maxOrderSizeUsd),
+      },
+      orderManagement: {
+        ...cfg.orderManagement,
+        maxOpenOrders: Number(result.maxOpenOrders),
+      },
+      riskManagement: {
+        ...cfg.riskManagement,
+        takeProfitPercent: Number(result.takeProfitPercent),
+        stopLossPercent: result.stopLossPercent !== undefined && result.stopLossPercent !== ''
+          ? Number(result.stopLossPercent)
+          : cfg.riskManagement.stopLossPercent,
+      },
+      timing: {
+        cycleIntervalMinMs: Number(result.cycleIntervalMinMs),
+        cycleIntervalMaxMs: Number(result.cycleIntervalMaxMs),
+      },
+      updatedAt: Date.now(),
+    };
+    this.engine.updateConfig(market.market_id, newCfg);
+    this.addLog(`{green-fg}Strategy config updated for ${market.base.symbol}/${market.quote.symbol}{/green-fg}`);
+  }
+
+  private async openManualOrderModal(): Promise<void> {
+    if (!this.screen) return;
+    const market = this.currentMarket;
+    if (!market || !this.orderManager) {
+      this.addLog('{yellow-fg}Order manager unavailable.{/yellow-fg}');
+      return;
+    }
+
+    // Gather live context for the rich order ticket
+    const mId = market.market_id;
+    const baseAvail = this.balanceTracker.getBaseBalanceHuman(mId) || 0;
+    const quoteAvail = this.balanceTracker.getQuoteBalanceHuman(mId) || 0;
+    const bestBid = this.marketData.getBestBid(mId);
+    const bestAsk = this.marketData.getBestAsk(mId);
+    const midPrice = this.marketData.getMidPrice(mId);
+    const spread = this.marketData.getSpreadPercent(mId);
+    // O2 fees are stored as a fraction over 1_000_000; convert to percent for display
+    const makerFeePct = (parseFloat(market.maker_fee) / 1_000_000) * 100;
+    const takerFeePct = (parseFloat(market.taker_fee) / 1_000_000) * 100;
+    const minOrderUsd = parseFloat(market.min_order || '0') || 0;
+
+    const result = await this.withModal(() =>
+      showOrderEntryModal(this.screen!, {
+        pair: `${market.base.symbol}/${market.quote.symbol}`,
+        baseSymbol: market.base.symbol,
+        quoteSymbol: market.quote.symbol,
+        baseAvail,
+        quoteAvail,
+        midPrice,
+        bestBid,
+        bestAsk,
+        spreadPercent: spread,
+        makerFeePercent: makerFeePct,
+        takerFeePercent: takerFeePct,
+        minOrderUsd,
+      })
+    );
+    if (!result) return;
+
+    // Map the modal's order-type to what OrderManager.placeOrder() accepts.
+    // (order-manager already handles the Spot/Market/PostOnly/IOC/FOK aliasing.)
+    const apiOrderType = result.orderType === 'Limit' ? 'Spot' : (result.orderType as OrderEntryType);
+
+    const priceScale = 10 ** market.quote.decimals;
+    const baseScale = 10 ** market.base.decimals;
+    const qtyScaled = String(Math.floor(result.quantityHuman * baseScale));
+    const priceScaled = result.priceHuman > 0 ? String(Math.floor(result.priceHuman * priceScale)) : '0';
+
+    const priceTag = result.priceHuman > 0 ? `$${result.priceHuman}` : 'MARKET';
+    const summary = `${result.side} ${result.quantityHuman} ${market.base.symbol} @ ${priceTag} (${result.orderType})`;
+
+    this.addLog(`{cyan-fg}Submitting ${summary}...{/cyan-fg}`);
+    try {
+      await this.orderManager.placeOrder(market, result.side, apiOrderType, priceScaled, qtyScaled);
+      this.addLog(`{green-fg}Order submitted: ${summary}{/green-fg}`);
+    } catch (err: any) {
+      this.addLog(`{red-fg}Order failed: ${err.message}{/red-fg}`);
+    }
+  }
+
+  private async openFlattenConfirm(): Promise<void> {
+    if (!this.screen) return;
+    const market = this.currentMarket;
+    if (!market || !this.orderManager) return;
+    const baseHuman = this.balanceTracker.getBaseBalanceHuman(market.market_id);
+
+    const confirmed = await this.withModal(() =>
+      showConfirmModal(this.screen!, {
+        title: `Flatten ${market.base.symbol}/${market.quote.symbol}`,
+        message: `Cancel all orders and market-sell ${fmtQty(baseHuman)} ${market.base.symbol}?\n\nThis cannot be undone.`,
+        confirmLabel: 'Flatten',
+      })
+    );
+    if (!confirmed) return;
+
+    this.addLog(`{yellow-fg}Flattening ${market.base.symbol}/${market.quote.symbol}...{/yellow-fg}`);
+    // TODO(wave3-wiring): typed once engine wave lands
+    const flatten = (this.orderManager as any).flattenPosition as
+      | ((marketId: string) => Promise<void>)
+      | undefined;
+    try {
+      if (typeof flatten === 'function') {
+        await flatten.call(this.orderManager, market.market_id);
+      } else {
+        await this.engine.cancelAllOrders();
+        if (baseHuman > 0) {
+          const baseScale = 10 ** market.base.decimals;
+          const qtyScaled = String(Math.floor(baseHuman * baseScale));
+          await this.orderManager.placeOrder(market, 'Sell', 'Market', '0', qtyScaled);
+        }
+      }
+      this.addLog(`{green-fg}Flatten complete{/green-fg}`);
+    } catch (err: any) {
+      this.addLog(`{red-fg}Flatten failed: ${err.message}{/red-fg}`);
+    }
+  }
+
+  private async openCancelAllConfirm(): Promise<void> {
+    if (!this.screen) return;
+    const market = this.currentMarket;
+    if (!market || !this.orderManager) return;
+
+    const confirmed = await this.withModal(() =>
+      showConfirmModal(this.screen!, {
+        title: 'Cancel all orders',
+        message: `Cancel all open orders for ${market.base.symbol}/${market.quote.symbol}?`,
+      })
+    );
+    if (!confirmed) return;
+
+    this.addLog('{yellow-fg}Cancelling all open orders...{/yellow-fg}');
+    try {
+      await this.orderManager.cancelAllOrders(market);
+      this.addLog('{green-fg}All open orders cancelled{/green-fg}');
+    } catch (err: any) {
+      this.addLog(`{red-fg}Cancel failed: ${err.message}{/red-fg}`);
+    }
+  }
+
+  private async toggleMarketPause(): Promise<void> {
+    if (!this.screen) return;
+    const market = this.currentMarket;
+    if (!market) return;
+    const mId = market.market_id;
+    const pair = `${market.base.symbol}/${market.quote.symbol}`;
+
+    // TODO(wave3-wiring): typed once engine wave lands
+    const eng = this.engine as any;
+    const isPausedFn = eng.isMarketPaused as ((id: string) => boolean) | undefined;
+    const pauseFn = eng.pauseMarket as ((id: string) => void) | undefined;
+    const resumeFn = eng.resumeMarket as ((id: string) => void) | undefined;
+
+    let nowPaused: boolean;
+    if (typeof pauseFn === 'function' && typeof resumeFn === 'function') {
+      const wasPaused = typeof isPausedFn === 'function'
+        ? isPausedFn.call(this.engine, mId)
+        : this.localPausedMarkets.has(mId);
+      if (wasPaused) {
+        resumeFn.call(this.engine, mId);
+        this.localPausedMarkets.delete(mId);
+        nowPaused = false;
+      } else {
+        pauseFn.call(this.engine, mId);
+        this.localPausedMarkets.add(mId);
+        nowPaused = true;
+      }
+    } else {
+      // Local-only fallback: flip the overlay flag and toggle the
+      // strategy's isActive flag on the engine so the scheduler skips it.
+      const cfg = this.engine.getStrategyConfig(mId);
+      if (!cfg) {
+        this.addLog(`{yellow-fg}No config for ${pair}.{/yellow-fg}`);
+        return;
+      }
+      const wasPaused = this.localPausedMarkets.has(mId);
+      const updated: StrategyConfig = { ...cfg, isActive: !wasPaused ? false : true, updatedAt: Date.now() };
+      this.engine.updateConfig(mId, updated);
+      if (wasPaused) {
+        this.localPausedMarkets.delete(mId);
+        nowPaused = false;
+      } else {
+        this.localPausedMarkets.add(mId);
+        nowPaused = true;
+      }
+    }
+    this.addLog(nowPaused
+      ? `{yellow-fg}Paused ${pair}{/yellow-fg}`
+      : `{green-fg}Resumed ${pair}{/green-fg}`);
+  }
+
+  private async openCancelOrderPicker(): Promise<void> {
+    if (!this.screen) return;
+    const market = this.currentMarket;
+    if (!market || !this.orderManager) return;
+
+    if (this.openOrders.length === 0) {
+      this.addLog(`{yellow-fg}No open orders to cancel.{/yellow-fg}`);
+      return;
+    }
+    const qScale = 10 ** market.quote.decimals;
+    const bScale = 10 ** market.base.decimals;
+    const items = this.openOrders.map((o) => {
+      const idShort = (o.order_id || '').slice(0, 8);
+      const priceN = parseFloat(o.price) / qScale;
+      const qtyN = parseFloat(o.quantity) / bScale;
+      const ageMs = Math.max(0, Date.now() - (o.created_at || Date.now()));
+      const ageMin = Math.floor(ageMs / 60000);
+      const ageSec = Math.floor((ageMs % 60000) / 1000);
+      return {
+        label: `${idShort}  ${o.side.padEnd(4)}  ${fmtPrice(priceN).padStart(10)}  ${fmtQty(qtyN).padStart(8)}  ${ageMin}m${ageSec}s`,
+        value: o.order_id,
+      };
+    });
+
+    const picked = await this.withModal(() =>
+      showPickerModal<string>(this.screen!, {
+        title: `Cancel order — ${market.base.symbol}/${market.quote.symbol}`,
+        items,
+      })
+    );
+    if (!picked) return;
+
+    const confirmed = await this.withModal(() =>
+      showConfirmModal(this.screen!, {
+        title: 'Confirm cancel',
+        message: `Cancel order ${picked.slice(0, 12)}?`,
+      })
+    );
+    if (!confirmed) return;
+
+    this.addLog(`{yellow-fg}Cancelling order ${picked.slice(0, 12)}...{/yellow-fg}`);
+    try {
+      await this.orderManager.cancelOrder(picked, market);
+      this.addLog(`{green-fg}Order cancelled{/green-fg}`);
+    } catch (err: any) {
+      this.addLog(`{red-fg}Cancel failed: ${err.message}{/red-fg}`);
+    }
   }
 
   shutdown(): void {

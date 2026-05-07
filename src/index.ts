@@ -18,10 +18,12 @@ import { TradingEngine } from './engine/trading-engine.js';
 import { PnLCalculator } from './engine/pnl-calculator.js';
 import { CompetitionTracker } from './engine/competition-tracker.js';
 import { NotificationManager } from './notifications/index.js';
+import { CommandRouter, type BotCommandHandlers } from './notifications/command-router.js';
 import { Dashboard } from './tui/dashboard.js';
 import { Logger } from './tui/logger.js';
 import type { Market } from './types/market.js';
-import type { StrategyConfig } from './types/strategy.js';
+import type { StrategyConfig, StrategyPreset } from './types/strategy.js';
+import { getPresetStrategyConfig, STRATEGY_PRESET_LABELS } from './types/strategy.js';
 import { existsSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
 import orderBookAbiJson from './types/contracts/orderbook-abi.json' with { type: 'json' };
@@ -434,14 +436,35 @@ async function startBot(opts: {
     dbQueries.upsertStrategyConfig(market.market_id, strategyConfig);
 
     engine.addMarket(market, strategyConfig);
+    // Record the source preset so hot-reload can map preset-file edits back to
+    // this market. Custom configs (loaded from disk via --config) get tagged
+    // 'custom' and are intentionally skipped by hot-reload.
+    const KNOWN_PRESETS: ReadonlySet<string> = new Set(['simple', 'volumeMaximizing', 'profitTaking', 'competitionMode']);
+    const presetTag = KNOWN_PRESETS.has(opts.strategy) ? opts.strategy : undefined;
+    engine.recordStrategyPresetName(market.market_id, presetTag);
     logger.info(
       `Strategy "${strategyConfig.name}" loaded for ${market.base.symbol}/${market.quote.symbol}`,
       'Boot'
     );
   }
 
-  // Initialize notifications
-  const notifications = new NotificationManager(config);
+  // Hot-reload: edits to strategies/*.json are picked up live for any market
+  // currently using that preset (markets with custom configs are skipped).
+  try {
+    engine.enableHotReload(config.strategiesDir);
+    logger.info(`Hot-reload watching ${config.strategiesDir}`, 'Boot');
+  } catch (err: any) {
+    logger.warn(`Hot-reload disabled: ${err?.message || err}`, 'Boot');
+  }
+
+  // Initialize notifications. `enableCommands` lets users control the bot
+  // from Telegram (/status, /pause, /resume, /cancel, /flatten, /strategy,
+  // /markets, /help). Off by default — flip with TELEGRAM_ENABLE_COMMANDS=true.
+  const enableTelegramCommands =
+    /^(true|1|yes)$/i.test(process.env.TELEGRAM_ENABLE_COMMANDS || '');
+  const notifications = new NotificationManager(config, {
+    telegram: { enableCommands: enableTelegramCommands },
+  });
 
   // Wire engine events to notifications
   let shuttingDown = false;
@@ -454,7 +477,29 @@ async function startBot(opts: {
   });
   engine.on('error', (marketId: string, err: Error) => {
     logger.error(`${err.message}`, marketId.slice(0, 8));
-    notifications.notify('ERROR', `Market ${marketId}: ${err.message}`);
+    // Use typed helper for order rejections; fall back to generic ERROR.
+    const msg = err?.message || String(err);
+    if (/reject|nonce|insufficient|invalid|forbidden/i.test(msg)) {
+      notifications.notifyOrderRejected(marketId, msg);
+    } else {
+      notifications.notify('ERROR', `Market ${marketId}: ${msg}`);
+    }
+  });
+
+  // Per-market lifecycle events (manual pause, hot-reload, auto-pause)
+  engine.on('marketPaused', (marketId: string) => {
+    logger.info(`Market paused: ${marketId.slice(0, 8)}`, 'Engine');
+  });
+  engine.on('marketResumed', (marketId: string) => {
+    logger.info(`Market resumed: ${marketId.slice(0, 8)}`, 'Engine');
+  });
+  engine.on('autoPaused', (info: { marketId: string; reason: string }) => {
+    const tag = info.marketId === '*' ? 'GLOBAL' : info.marketId.slice(0, 8);
+    logger.warn(`Auto-paused [${tag}]: ${info.reason}`, 'Engine');
+    notifications.notifyAutoPaused(info.marketId, info.reason);
+  });
+  engine.on('configReloaded', (marketId: string, presetName: string) => {
+    logger.info(`Hot-reloaded "${presetName}" for ${marketId.slice(0, 8)}`, 'Engine');
   });
   orderManager.on('fill', (fill) => {
     const market = marketData.getMarket(fill.marketId);
@@ -491,6 +536,7 @@ async function startBot(opts: {
       }
       dashboard.updateSessionExpiry(newSession.expiry);
       logger.info(`Session recreated: ${newSession.sessionId.slice(0, 10)}...`, 'Session');
+      notifications.notifySessionRecovered(newSession.sessionId);
       engine.start();
     } catch (err: any) {
       logger.error(`Session recovery failed: ${err.message}`, 'Session');
@@ -582,6 +628,29 @@ async function startBot(opts: {
   process.on('SIGTERM', signalHandler);
   process.on('SIGHUP', signalHandler);
 
+  // WS-down notification: only fire if the WS stays down for 30s+ (avoid
+  // alert spam on transient blips). The engine's auto-pause monitor handles
+  // the trading-side response separately.
+  let wsDownSince: number | null = null;
+  let wsDownTimer: ReturnType<typeof setTimeout> | null = null;
+  wsClient.on('disconnected', () => {
+    if (wsDownSince !== null) return;
+    wsDownSince = Date.now();
+    if (wsDownTimer) clearTimeout(wsDownTimer);
+    wsDownTimer = setTimeout(() => {
+      if (wsDownSince !== null) {
+        notifications.notifyWsDown(wsDownSince).catch(() => {});
+      }
+    }, 30_000);
+  });
+  wsClient.on('connected', () => {
+    wsDownSince = null;
+    if (wsDownTimer) {
+      clearTimeout(wsDownTimer);
+      wsDownTimer = null;
+    }
+  });
+
   // Subscribe to real-time trade feed
   wsClient.subscribeTrades(requestedMarkets.map(m => m.market_id));
 
@@ -599,6 +668,125 @@ async function startBot(opts: {
     } catch {
       logger.warn(`Failed to fetch balances for ${market.base.symbol}/${market.quote.symbol}`, 'Balance');
     }
+  }
+
+  // Telegram inbound commands. Wired even when polling is disabled — the
+  // router just won't be called. Activates only if both the chat allowlist
+  // and TELEGRAM_ENABLE_COMMANDS are set.
+  if (enableTelegramCommands && config.notifications.telegram.chatId) {
+    const allowlist = new Set<string>(
+      config.notifications.telegram.chatId
+        .split(',')
+        .map((s: string) => s.trim())
+        .filter(Boolean)
+    );
+
+    const findMarketByTag = (tag?: string): Market | null => {
+      if (!tag) return requestedMarkets[0] || null;
+      const upper = tag.toUpperCase();
+      return (
+        requestedMarkets.find(
+          (m) => `${m.base.symbol}_${m.quote.symbol}`.toUpperCase() === upper
+        ) ||
+        requestedMarkets.find(
+          (m) => m.market_id.toLowerCase().startsWith(tag.toLowerCase())
+        ) ||
+        null
+      );
+    };
+
+    const handlers: BotCommandHandlers = {
+      status: async () => {
+        const lines: string[] = [];
+        lines.push(`Engine: ${engine.isRunning ? 'RUNNING' : 'PAUSED'}`);
+        lines.push(`Markets: ${requestedMarkets.length}`);
+        for (const m of requestedMarkets) {
+          const pair = `${m.base.symbol}/${m.quote.symbol}`;
+          const paused = engine.isMarketPaused(m.market_id);
+          const preset = engine.getStrategyPresetName(m.market_id) || 'custom';
+          const last = engine.getLastExecutionResult(m.market_id);
+          const lastBit = last?.skipReason ? ` skip=${last.skipReason}` : last?.executed ? ' exec=ok' : '';
+          lines.push(`  ${pair}: ${paused ? 'PAUSED' : 'active'} preset=${preset}${lastBit}`);
+        }
+        return lines.join('\n');
+      },
+      pause: async () => {
+        if (!engine.isRunning) return 'Already paused.';
+        engine.stop();
+        return 'Engine paused.';
+      },
+      resume: async () => {
+        if (engine.isRunning) return 'Already running.';
+        engine.start();
+        return 'Engine resumed.';
+      },
+      cancelAll: async (marketTag?: string) => {
+        if (!marketTag) {
+          await engine.cancelAllOrders();
+          return 'Cancelled all open orders across all markets.';
+        }
+        const m = findMarketByTag(marketTag);
+        if (!m) return `Market not found: ${marketTag}`;
+        await orderManager.cancelAllOrders(m);
+        return `Cancelled all open orders for ${m.base.symbol}/${m.quote.symbol}.`;
+      },
+      flatten: async (marketTag?: string) => {
+        const m = findMarketByTag(marketTag);
+        if (!m) return `Market not found: ${marketTag || '(default)'}`;
+        await orderManager.cancelAllOrders(m);
+        const balances = await balanceTracker.getMarketBalances(m.market_id).catch(() => null);
+        if (!balances) return 'Cancelled orders, but failed to read balance.';
+        const baseUnlocked = parseFloat(balances.base.unlocked || '0');
+        if (!(baseUnlocked > 0)) {
+          return `Cancelled orders. No ${m.base.symbol} balance to flatten.`;
+        }
+        try {
+          await orderManager.placeOrder(m, 'Sell', 'Market', '0', balances.base.unlocked);
+          return `Flattened ${m.base.symbol}/${m.quote.symbol} (sold ${baseUnlocked / 10 ** m.base.decimals} ${m.base.symbol}).`;
+        } catch (err: any) {
+          return `Cancelled orders, but flatten failed: ${err?.message || err}`;
+        }
+      },
+      setStrategy: async (presetRaw: string, marketTag?: string) => {
+        const preset = (presetRaw || '').trim() as StrategyPreset;
+        const known = ['simple', 'volumeMaximizing', 'profitTaking', 'competitionMode', 'custom'];
+        if (!known.includes(preset)) {
+          return `Unknown preset "${presetRaw}". Choices: ${known.join(', ')}`;
+        }
+        const targets: Market[] = marketTag
+          ? (findMarketByTag(marketTag) ? [findMarketByTag(marketTag)!] : [])
+          : requestedMarkets;
+        if (targets.length === 0) return `Market not found: ${marketTag}`;
+        for (const m of targets) {
+          await engine.setStrategyPreset(m.market_id, preset);
+        }
+        return `Strategy "${STRATEGY_PRESET_LABELS[preset] ?? preset}" applied to ${targets.length} market(s).`;
+      },
+      listMarkets: async () => {
+        return requestedMarkets
+          .map((m) => `${m.base.symbol}/${m.quote.symbol} ${engine.isMarketPaused(m.market_id) ? '(paused)' : ''}`)
+          .join('\n');
+      },
+      help: async () => {
+        return [
+          'Commands:',
+          '/status — show engine + per-market state',
+          '/pause — pause the engine globally',
+          '/resume — resume the engine globally',
+          '/cancel [MARKET] — cancel open orders (default: all markets)',
+          '/flatten [MARKET] — cancel + market-sell base balance',
+          '/strategy <preset> [MARKET] — switch strategy preset',
+          '/markets — list active markets',
+          '/help — this message',
+        ].join('\n');
+      },
+    };
+
+    const router = new CommandRouter(handlers, allowlist);
+    notifications.attachCommandRouter(router);
+    logger.info(`Telegram inbound commands enabled (allowlist size=${allowlist.size})`, 'Notifications');
+  } else if (config.notifications.telegram.chatId && !enableTelegramCommands) {
+    logger.info('Telegram alerts active (commands off — set TELEGRAM_ENABLE_COMMANDS=true to enable)', 'Notifications');
   }
 
   // Start dashboard
