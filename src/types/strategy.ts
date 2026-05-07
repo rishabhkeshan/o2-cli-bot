@@ -1,9 +1,11 @@
 // ============================================
 // CORE ORDER CONFIGURATION
 // ============================================
+export type OrderTypeName = 'Market' | 'Spot' | 'PostOnly' | 'IOC' | 'FOK';
+
 export interface OrderConfig {
   // Order Type
-  orderType: 'Market' | 'Spot';
+  orderType: OrderTypeName;
 
   // Price Configuration
   priceMode: 'offsetFromMid' | 'offsetFromBestBid' | 'offsetFromBestAsk' | 'market';
@@ -18,6 +20,22 @@ export interface OrderConfig {
   // Price Randomization
   priceRandomizationEnabled?: boolean; // Add random jitter to order prices each cycle
   priceRandomizationRangePercent?: number; // Max % random offset (e.g., 0.05 = +/-0.05%)
+
+  // Slippage cap on Market orders — abort placement if estimated VWAP slippage exceeds this %
+  slippageMaxPercent?: number;
+
+  // Auto-replace open orders if reference price has drifted by more than this % since placement
+  autoReplaceOnDriftPercent?: number;
+
+  // Volatility-adaptive spread: scale priceOffsetPercent by realized vol over a lookback window
+  volatilityAdaptiveSpreadEnabled?: boolean;
+  volatilityLookbackBars?: number; // e.g., 30 bars
+  volatilitySpreadMultiplier?: number; // offset_effective = offset * (1 + multiplier * realizedVol)
+
+  // Inventory-skewed quoting: skew bid/ask offsets based on base vs quote balance ratio
+  inventorySkewEnabled?: boolean;
+  inventoryTargetBaseRatio?: number; // 0..1, target fraction of equity held in base (0.5 = balanced)
+  inventoryMaxSkewPercent?: number; // max additional offset added when fully imbalanced
 }
 
 // ============================================
@@ -38,6 +56,9 @@ export interface PositionSizingConfig {
   // Constraints
   minOrderSizeUsd: number; // Minimum order size (e.g., 5 USD)
   maxOrderSizeUsd?: number; // Maximum order size per order (optional cap)
+
+  // Aggregate cap across all currently-open orders for this market (optional)
+  maxAggregatePositionUsd?: number;
 }
 
 // ============================================
@@ -70,6 +91,19 @@ export interface RiskManagementConfig {
   // Max Session Loss - pauses trading when session P&L drops below threshold
   maxSessionLossEnabled: boolean;
   maxSessionLossUsd: number; // e.g., 100 = pause if session P&L drops to -$100
+
+  // Daily loss limit — auto-pause when realized P&L for the current UTC day drops below threshold
+  maxDailyLossEnabled?: boolean;
+  maxDailyLossUsd?: number; // e.g., 50 = pause if today's P&L drops to -$50
+  dailyLossResetUtcHour?: number; // Hour (0-23) when the daily window resets, default 0 (UTC midnight)
+
+  // Trailing stop — exit when price falls more than this % below the highest price seen since position opened
+  trailingStopEnabled?: boolean;
+  trailingStopPercent?: number; // e.g., 2 = exit when price drops 2% from peak
+
+  // Auto-pause guards
+  autoPauseOnWsDownSeconds?: number; // pause trading if WS has been down for this many seconds (0/undefined = disabled)
+  autoPauseOnConsecutiveFailures?: number; // pause after N consecutive order rejections (0/undefined = disabled)
 }
 
 // ============================================
@@ -103,6 +137,16 @@ export interface StrategyConfig {
   };
   averageBuyPrice?: string;
   averageSellPrice?: string;
+
+  // Trailing-stop runtime state — highest price observed while holding the current position
+  trailingPeakPrice?: string;
+
+  // Daily loss tracker — start of the current UTC day window and realized P&L accumulated since
+  dailyLossWindowStart?: number; // ms epoch
+  dailyRealizedPnl?: number; // USD, signed
+
+  // Competition: prefer markets that currently have a volume boost multiplier when scheduling
+  preferBoostedMarkets?: boolean;
 
   // Console Settings
   consoleMode?: 'simple' | 'debug'; // Console verbosity: simple (essential) or debug (all details)
@@ -337,4 +381,40 @@ export interface StrategyExecutionResult {
   orders: OrderExecution[];
   nextRunAt?: number;
   skipReason?: string; // Human-readable reason why execution was skipped (e.g., spread exceeded)
+  skipCategory?: SkipCategory; // Stable, machine-readable category for UI grouping
+  diagnostics?: ExecutionDiagnostics; // Optional structured diagnostics for the dashboard
+}
+
+// Stable categories for skip reasons. Used by the TUI to render colored chips and group state.
+export type SkipCategory =
+  | 'spread_exceeded'
+  | 'insufficient_balance'
+  | 'max_open_orders'
+  | 'profit_floor'
+  | 'session_loss_hit'
+  | 'daily_loss_hit'
+  | 'stop_loss_active'
+  | 'paused'
+  | 'ws_down'
+  | 'consecutive_failures'
+  | 'aggregate_cap_hit'
+  | 'slippage_exceeded'
+  | 'cooldown'
+  | 'other';
+
+export interface ExecutionDiagnostics {
+  effectiveSpreadPercent?: number;
+  midPrice?: string;
+  bestBid?: string;
+  bestAsk?: string;
+  realizedVolPercent?: number; // recent realized volatility
+  inventoryBaseRatio?: number; // current fraction of equity in base
+  buySkewPercent?: number; // applied buy-side offset after skew/vol adjustments
+  sellSkewPercent?: number;
+  openOrdersBuy?: number;
+  openOrdersSell?: number;
+  aggregateOpenUsd?: number; // notional of all open orders
+  trailingPeak?: string;
+  dailyPnlUsd?: number;
+  reasonDetail?: string;
 }

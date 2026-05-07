@@ -74,6 +74,12 @@ export class OrderManager extends EventEmitter {
   }
 
   // Place an order with SettleBalance sandwich
+  // orderType accepts the legacy values 'Market'|'Spot' as well as the extended
+  // strategy values 'PostOnly'|'IOC'|'FOK'|'Limit'. Extended values are mapped to the
+  // contract's enum here so existing callers using 'Market'/'Spot' are unaffected.
+  // Note: the underlying contract has no native ImmediateOrCancel — we map IOC -> FillOrKill
+  // (see session-manager.ts switch). If neither is acceptable, callers should fall back
+  // to 'Market' explicitly.
   async placeOrder(
     market: Market,
     side: string,
@@ -82,12 +88,36 @@ export class OrderManager extends EventEmitter {
     quantityScaled: string
   ): Promise<SessionActionsResponse> {
     const tradeAccountId = this.sessionManager.tradeAccount;
+
+    // Map strategy-level order types to contract-level enum values understood by
+    // session-manager.submitActionsImpl (PostOnly | Limit | Spot | Market | FillOrKill).
+    let contractOrderType = orderType;
+    switch (orderType) {
+      case 'Market':
+      case 'Spot':
+      case 'Limit':
+      case 'PostOnly':
+      case 'FillOrKill':
+        // pass-through, already a recognized enum value
+        break;
+      case 'IOC':
+        // No native ImmediateOrCancel on the contract — closest semantic is FillOrKill.
+        contractOrderType = 'FillOrKill';
+        break;
+      case 'FOK':
+        contractOrderType = 'FillOrKill';
+        break;
+      default:
+        console.warn(`[OrderManager] Unknown orderType "${orderType}", falling back to Market`);
+        contractOrderType = 'Market';
+    }
+
     const actions: SessionAction[] = [
       { SettleBalance: { to: { ContractId: tradeAccountId } } },
       {
         CreateOrder: {
           side,
-          order_type: orderType,
+          order_type: contractOrderType,
           price: priceScaled,
           quantity: quantityScaled,
         },
@@ -129,6 +159,18 @@ export class OrderManager extends EventEmitter {
     ];
     await this.sessionManager.submitActions(market.market_id, market, actions);
     dbQueries.updateOrderStatus(orderId, 'cancelled');
+  }
+
+  // Submit a single SettleBalance action for a market. Used during graceful
+  // shutdown to drain any settled-but-not-withdrawn trade proceeds back into
+  // the trade account. If there is nothing pending, the call is a cheap no-op
+  // (the orderbook returns empty).
+  async settleBalance(market: Market): Promise<void> {
+    const tradeAccountId = this.sessionManager.tradeAccount;
+    const actions: SessionAction[] = [
+      { SettleBalance: { to: { ContractId: tradeAccountId } } },
+    ];
+    await this.sessionManager.submitActions(market.market_id, market, actions);
   }
 
   // Cancel all open orders for a market

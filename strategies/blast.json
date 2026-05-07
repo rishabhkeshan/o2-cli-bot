@@ -1,0 +1,47 @@
+{
+  "name": "Blast",
+  "isActive": true,
+
+  "orderConfig": {
+    "orderType": "Market",
+    "priceMode": "market",
+    "priceOffsetPercent": 0,
+    "maxSpreadPercent": 10,
+    "side": "Both",
+    "priceRandomizationEnabled": false
+  },
+
+  "positionSizing": {
+    "sizeMode": "percentageOfBalance",
+    "balancePercentage": 100,
+    "baseBalancePercentage": 100,
+    "quoteBalancePercentage": 100,
+    "minOrderSizeUsd": 5
+  },
+
+  "orderManagement": {
+    "trackFillPrices": true,
+    "onlySellAboveBuyPrice": false,
+    "maxOpenOrders": 1
+  },
+
+  "riskManagement": {
+    "takeProfitPercent": 0,
+    "stopLossEnabled": false,
+    "stopLossPercent": 0,
+    "orderTimeoutEnabled": false,
+    "orderTimeoutMinutes": 30,
+    "maxSessionLossEnabled": true,
+    "maxSessionLossUsd": 1500,
+    "maxDailyLossEnabled": true,
+    "maxDailyLossUsd": 3000,
+    "dailyLossResetUtcHour": 0,
+    "autoPauseOnConsecutiveFailures": 20,
+    "autoPauseOnWsDownSeconds": 60
+  },
+
+  "timing": {
+    "cycleIntervalMinMs": 500,
+    "cycleIntervalMaxMs": 800
+  }
+}

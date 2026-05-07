@@ -1,11 +1,22 @@
 import Decimal from 'decimal.js';
 import type { Market, OrderBookDepth } from '../types/market.js';
-import type { StrategyConfig, StrategyExecutionResult, OrderExecution } from '../types/strategy.js';
+import type {
+  StrategyConfig,
+  StrategyExecutionResult,
+  OrderExecution,
+  ExecutionDiagnostics,
+  SkipCategory,
+} from '../types/strategy.js';
 import type { OrderManager } from './order-manager.js';
 import type { MarketDataService } from './market-data.js';
 import type { BalanceTracker, MarketBalances } from './balance-tracker.js';
 import { roundDownToMarketPrecision, scaleUpAndTruncateToInt, formatPrice, isValidPrice } from '../utils/price-math.js';
 import * as dbQueries from '../db/queries.js';
+import {
+  computeDailyWindowStart,
+  ConsecutiveFailureTracker,
+  MidPriceHistory,
+} from './risk-tracker.js';
 
 /**
  * StrategyExecutor - the heart of the trading logic.
@@ -21,6 +32,30 @@ export class StrategyExecutor {
   private orderManager: OrderManager;
   private marketData: MarketDataService;
   private balanceTracker: BalanceTracker;
+
+  // Realized-vol input — accumulated per-market mid prices sampled each cycle.
+  private midPriceHistory = new MidPriceHistory(240);
+
+  // Consecutive order-placement failures per market, reset on any successful placement.
+  private failureTracker = new ConsecutiveFailureTracker();
+
+  // Last realized-pnl total observed per market — used to attribute deltas to the
+  // current daily window when the daily-loss limit is enabled.
+  private lastRealizedPnlByMarket: Map<string, number> = new Map();
+
+  /**
+   * Hand-off field for the trading-engine agent.
+   * When consecutive order failures hit `riskManagement.autoPauseOnConsecutiveFailures`,
+   * we set this to a non-null value. The engine should poll this field, act on it
+   * (e.g. pause the engine, surface a notification) and call `clearAutoPauseRequest()`
+   * to acknowledge.
+   */
+  public autoPauseRequested: { reason: string; timestamp: number; marketId: string } | null = null;
+
+  /** Public clearer used by the engine after it acts on `autoPauseRequested`. */
+  public clearAutoPauseRequest(): void {
+    this.autoPauseRequested = null;
+  }
 
   constructor(
     orderManager: OrderManager,
@@ -64,15 +99,70 @@ export class StrategyExecutor {
     const executionStartTime = Date.now();
     const nextRunAt = executionStartTime + minInterval + Math.random() * (maxInterval - minInterval);
 
+    // Diagnostics object accumulated through the cycle and attached to every result.
+    const diagnostics: ExecutionDiagnostics = {};
+
     try {
+      // ---------------------------------------------------------------
+      // 0. DAILY LOSS WINDOW BOOKKEEPING (opt-in)
+      // ---------------------------------------------------------------
+      // We update window-start / dailyRealizedPnl on the live `config` object so
+      // it gets persisted via upsertStrategyConfig elsewhere in the system.
+      if (config.riskManagement.maxDailyLossEnabled) {
+        const resetHour = config.riskManagement.dailyLossResetUtcHour ?? 0;
+        const expectedWindowStart = computeDailyWindowStart(executionStartTime, resetHour);
+
+        if (!config.dailyLossWindowStart || config.dailyLossWindowStart < expectedWindowStart) {
+          // Crossed into a new daily window — reset bucket.
+          config.dailyLossWindowStart = expectedWindowStart;
+          config.dailyRealizedPnl = 0;
+          // Reset baseline so subsequent deltas attribute correctly.
+          this.lastRealizedPnlByMarket.set(
+            market.market_id,
+            dbQueries.getTradeStats(market.market_id).realizedPnl,
+          );
+          dbQueries.upsertStrategyConfig(market.market_id, config);
+        } else {
+          // Within window — accumulate any new realized P&L since last cycle.
+          const stats = dbQueries.getTradeStats(market.market_id);
+          const lastSeen = this.lastRealizedPnlByMarket.get(market.market_id);
+          if (lastSeen === undefined) {
+            this.lastRealizedPnlByMarket.set(market.market_id, stats.realizedPnl);
+          } else {
+            const delta = stats.realizedPnl - lastSeen;
+            if (delta !== 0) {
+              config.dailyRealizedPnl = (config.dailyRealizedPnl ?? 0) + delta;
+              this.lastRealizedPnlByMarket.set(market.market_id, stats.realizedPnl);
+              dbQueries.upsertStrategyConfig(market.market_id, config);
+            }
+          }
+        }
+
+        diagnostics.dailyPnlUsd = config.dailyRealizedPnl ?? 0;
+
+        const cap = config.riskManagement.maxDailyLossUsd ?? 0;
+        if (cap > 0 && (config.dailyRealizedPnl ?? 0) <= -cap) {
+          return this.buildSkipResult(
+            nextRunAt,
+            `${pair}: Daily loss $${Math.abs(config.dailyRealizedPnl ?? 0).toFixed(2)} hit cap $${cap}, pausing for the rest of the UTC day`,
+            'daily_loss_hit',
+            diagnostics,
+          );
+        }
+      }
+
       // ---------------------------------------------------------------
       // 1. CHECK MAX SESSION LOSS
       // ---------------------------------------------------------------
       if (config.riskManagement.maxSessionLossEnabled && config.riskManagement.maxSessionLossUsd > 0) {
         const stats = dbQueries.getTradeStats(market.market_id);
         if (stats.realizedPnl < -config.riskManagement.maxSessionLossUsd) {
-          const skipReason = `${pair}: Session loss $${Math.abs(stats.realizedPnl).toFixed(2)} exceeds max $${config.riskManagement.maxSessionLossUsd}, pausing`;
-          return { executed: false, orders: [], nextRunAt, skipReason };
+          return this.buildSkipResult(
+            nextRunAt,
+            `${pair}: Session loss $${Math.abs(stats.realizedPnl).toFixed(2)} exceeds max $${config.riskManagement.maxSessionLossUsd}, pausing`,
+            'session_loss_hit',
+            diagnostics,
+          );
         }
       }
 
@@ -85,6 +175,8 @@ export class StrategyExecutor {
           executed: stopLossResult.orders.length > 0,
           orders: stopLossResult.orders,
           nextRunAt,
+          skipCategory: stopLossResult.orders.length > 0 ? undefined : 'stop_loss_active',
+          diagnostics,
         };
       }
 
@@ -93,10 +185,31 @@ export class StrategyExecutor {
       // ---------------------------------------------------------------
       const ticker = await this.marketData.getTicker(market.market_id);
       if (!ticker) {
-        return { executed: false, orders: [], skipReason: `${pair}: No ticker data available` };
+        return this.buildSkipResult(
+          nextRunAt,
+          `${pair}: No ticker data available`,
+          'ws_down',
+          diagnostics,
+        );
       }
 
       const orderBook = await this.marketData.getOrderBook(market.market_id);
+
+      // Sample a mid-price for the realized-vol history (used by adaptive spread).
+      const sampledMid = this.marketData.getMidPrice(market.market_id);
+      if (sampledMid && sampledMid > 0) {
+        this.midPriceHistory.push(market.market_id, sampledMid);
+      }
+
+      // Populate baseline diagnostics (best bid/ask/mid) when computable.
+      if (orderBook?.bids?.[0]?.[0] && orderBook?.asks?.[0]?.[0]) {
+        const qScale = new Decimal(10).pow(market.quote.decimals);
+        const bid = new Decimal(orderBook.bids[0][0]).div(qScale);
+        const ask = new Decimal(orderBook.asks[0][0]).div(qScale);
+        diagnostics.bestBid = bid.toString();
+        diagnostics.bestAsk = ask.toString();
+        diagnostics.midPrice = bid.plus(ask).div(2).toString();
+      }
 
       // ---------------------------------------------------------------
       // 4. CHECK SPREAD VS maxSpreadPercent
@@ -104,6 +217,10 @@ export class StrategyExecutor {
       if (orderBook && config.orderConfig.maxSpreadPercent > 0) {
         const referenceOrderSizeUsd = config.positionSizing.minOrderSizeUsd || 5;
         const spreadResult = this.calculateEffectiveSpread(orderBook, market, referenceOrderSizeUsd);
+
+        if (spreadResult) {
+          diagnostics.effectiveSpreadPercent = spreadResult.spread;
+        }
 
         if (spreadResult && spreadResult.spread > config.orderConfig.maxSpreadPercent) {
           let skipReason: string;
@@ -117,7 +234,7 @@ export class StrategyExecutor {
               skipReason = `${pair}: Spread ${spreadResult.spread.toFixed(2)}% exceeds max ${config.orderConfig.maxSpreadPercent}%, skipping`;
             }
           }
-          return { executed: false, orders: [], nextRunAt, skipReason };
+          return this.buildSkipResult(nextRunAt, skipReason, 'spread_exceeded', diagnostics);
         }
       }
 
@@ -135,10 +252,37 @@ export class StrategyExecutor {
       const minSize = config.positionSizing.minOrderSizeUsd || 5;
 
       if (quoteHuman.toNumber() < minSize && baseValueUsd < minSize) {
-        return {
-          executed: false, orders: [], nextRunAt,
-          skipReason: `${pair}: Insufficient balance (${quoteHuman.toFixed(2)} ${market.quote.symbol}, ${baseHuman.toFixed(4)} ${market.base.symbol})`,
-        };
+        return this.buildSkipResult(
+          nextRunAt,
+          `${pair}: Insufficient balance (${quoteHuman.toFixed(2)} ${market.quote.symbol}, ${baseHuman.toFixed(4)} ${market.base.symbol})`,
+          'insufficient_balance',
+          diagnostics,
+        );
+      }
+
+      // Inventory-skew calculation (opt-in). Influences buy/sell offsets later.
+      let buySkewPercent = 0;
+      let sellSkewPercent = 0;
+      if (
+        config.orderConfig.inventorySkewEnabled &&
+        midPrice > 0
+      ) {
+        const baseEquity = baseHuman.mul(midPrice);
+        const totalEquity = baseEquity.plus(quoteHuman);
+        if (totalEquity.gt(0)) {
+          const baseRatio = baseEquity.div(totalEquity).toNumber();
+          const target = config.orderConfig.inventoryTargetBaseRatio ?? 0.5;
+          const cap = config.orderConfig.inventoryMaxSkewPercent ?? 0;
+          // Deviation in [-target, 1-target]; normalize to [-1, 1].
+          // Long-of-target -> we hold too much base, want to discourage further buys
+          // and encourage sells (widen buy, tighten sell).
+          const denom = Math.max(target, 1 - target) || 0.5;
+          const deviation = (baseRatio - target) / denom;
+          const clamped = Math.max(-1, Math.min(1, deviation));
+          buySkewPercent = clamped * cap; // positive when long base => widen buy (push lower)
+          sellSkewPercent = clamped * cap; // positive when long base => tighten sell (push lower)
+          diagnostics.inventoryBaseRatio = baseRatio;
+        }
       }
 
       // ---------------------------------------------------------------
@@ -147,10 +291,21 @@ export class StrategyExecutor {
       let shouldPlaceBuy = true;
       let shouldPlaceSell = true;
 
+      // Pre-fetch open orders once — also used for auto-replace and aggregate cap.
+      let openOrdersCached: Awaited<ReturnType<OrderManager['getOpenOrders']>> | null = null;
+      const fetchOpenOrders = async () => {
+        if (openOrdersCached === null) {
+          openOrdersCached = await this.orderManager.getOpenOrders(market);
+        }
+        return openOrdersCached;
+      };
+
       if (config.orderManagement.maxOpenOrders > 0) {
-        const openOrders = await this.orderManager.getOpenOrders(market);
+        const openOrders = await fetchOpenOrders();
         const buyOrders = openOrders.filter((o) => o.side === 'Buy');
         const sellOrders = openOrders.filter((o) => o.side === 'Sell');
+        diagnostics.openOrdersBuy = buyOrders.length;
+        diagnostics.openOrdersSell = sellOrders.length;
 
         if (config.orderConfig.side === 'Buy' || config.orderConfig.side === 'Both') {
           if (buyOrders.length >= config.orderManagement.maxOpenOrders) {
@@ -181,9 +336,118 @@ export class StrategyExecutor {
       }
 
       // ---------------------------------------------------------------
-      // 7. CALCULATE PRICES
+      // 7. CALCULATE PRICES (with optional vol-adaptive + inventory skew)
       // ---------------------------------------------------------------
-      const prices = this.calculatePrices(market, ticker, orderBook, config.orderConfig);
+      let realizedVolPercent = 0;
+      if (config.orderConfig.volatilityAdaptiveSpreadEnabled) {
+        const lookback = config.orderConfig.volatilityLookbackBars ?? 30;
+        realizedVolPercent = this.midPriceHistory.realizedVolPercent(market.market_id, lookback);
+        diagnostics.realizedVolPercent = realizedVolPercent;
+      }
+
+      const prices = this.calculatePrices(
+        market,
+        ticker,
+        orderBook,
+        config.orderConfig,
+        { realizedVolPercent, buySkewPercent, sellSkewPercent },
+      );
+
+      // Persist computed effective skew offsets.
+      if (config.orderConfig.inventorySkewEnabled) {
+        diagnostics.buySkewPercent = buySkewPercent;
+        diagnostics.sellSkewPercent = sellSkewPercent;
+      }
+
+      // ---------------------------------------------------------------
+      // 7a. TRAILING STOP CHECK (opt-in, when holding a position)
+      // ---------------------------------------------------------------
+      if (
+        config.riskManagement.trailingStopEnabled &&
+        config.riskManagement.trailingStopPercent &&
+        config.riskManagement.trailingStopPercent > 0
+      ) {
+        const baseValueForStop = midPrice > 0 ? baseHuman.mul(midPrice).toNumber() : 0;
+        const minNotional = config.positionSizing.minOrderSizeUsd || 5;
+        if (baseValueForStop >= minNotional && midPrice > 0) {
+          const peakDecimal = config.trailingPeakPrice
+            ? new Decimal(config.trailingPeakPrice)
+            : (config.averageBuyPrice && config.averageBuyPrice !== '0'
+                ? new Decimal(config.averageBuyPrice)
+                : new Decimal(midPrice));
+          const currentDecimal = new Decimal(midPrice);
+          const newPeak = currentDecimal.gt(peakDecimal) ? currentDecimal : peakDecimal;
+          if (!newPeak.eq(peakDecimal) || !config.trailingPeakPrice) {
+            config.trailingPeakPrice = newPeak.toString();
+            dbQueries.upsertStrategyConfig(market.market_id, config);
+          }
+          diagnostics.trailingPeak = config.trailingPeakPrice;
+
+          const dropThresholdPct = config.riskManagement.trailingStopPercent;
+          const exitThreshold = newPeak.mul(1 - dropThresholdPct / 100);
+          if (currentDecimal.lt(exitThreshold)) {
+            console.log(`[StrategyExecutor] ${pair}: Trailing stop triggered — peak ${newPeak.toFixed(6)}, current ${currentDecimal.toFixed(6)}, threshold ${exitThreshold.toFixed(6)} (-${dropThresholdPct}%)`);
+            // Reuse existing stop-loss exit code path: cancel orders and market-sell base.
+            const trailingResult = await this.executeTrailingStopExit(market, config, currentDecimal);
+            return {
+              executed: trailingResult.orders.length > 0,
+              orders: trailingResult.orders,
+              nextRunAt,
+              skipCategory: trailingResult.orders.length > 0 ? undefined : 'stop_loss_active',
+              diagnostics,
+            };
+          }
+        } else if (baseValueForStop < minNotional && config.trailingPeakPrice) {
+          // Position fully closed — clear trailing peak so next entry starts fresh.
+          config.trailingPeakPrice = undefined;
+          dbQueries.upsertStrategyConfig(market.market_id, config);
+        }
+      }
+
+      // ---------------------------------------------------------------
+      // 7b. AUTO-REPLACE OPEN ORDERS ON DRIFT (opt-in)
+      // ---------------------------------------------------------------
+      if (config.orderConfig.autoReplaceOnDriftPercent && config.orderConfig.autoReplaceOnDriftPercent > 0) {
+        const driftThreshold = config.orderConfig.autoReplaceOnDriftPercent;
+        const open = await fetchOpenOrders();
+        if (open.length > 0) {
+          const qScale = new Decimal(10).pow(market.quote.decimals);
+          for (const o of open) {
+            const target = o.side === 'Buy' ? prices.buyPrice : prices.sellPrice;
+            if (!target || !target.gt(0)) continue;
+            const orderPrice = new Decimal(o.price).div(qScale);
+            if (orderPrice.lte(0)) continue;
+            const driftPct = orderPrice.minus(target).abs().div(target).mul(100).toNumber();
+            if (driftPct > driftThreshold) {
+              try {
+                await this.orderManager.cancelOrder(o.order_id, market);
+                console.log(`[StrategyExecutor] ${pair}: Auto-replace cancel ${o.side} @ ${orderPrice.toFixed(6)} drifted ${driftPct.toFixed(2)}% from ${target.toFixed(6)}`);
+              } catch (err) {
+                console.error(`[StrategyExecutor] Auto-replace cancel failed for ${o.order_id}:`, err);
+              }
+            }
+          }
+        }
+      }
+
+      // ---------------------------------------------------------------
+      // 7c. AGGREGATE OPEN-NOTIONAL DIAGNOSTIC + PRECHECK
+      // ---------------------------------------------------------------
+      const aggregateCap = config.positionSizing.maxAggregatePositionUsd;
+      let aggregateOpenUsd = 0;
+      if (aggregateCap !== undefined && aggregateCap > 0) {
+        const open = await fetchOpenOrders();
+        const qScale = new Decimal(10).pow(market.quote.decimals);
+        const bScale = new Decimal(10).pow(market.base.decimals);
+        for (const o of open) {
+          const px = new Decimal(o.price).div(qScale);
+          const remaining = new Decimal(o.quantity).minus(o.quantity_fill || '0').div(bScale);
+          if (remaining.gt(0) && px.gt(0)) {
+            aggregateOpenUsd += remaining.mul(px).toNumber();
+          }
+        }
+        diagnostics.aggregateOpenUsd = aggregateOpenUsd;
+      }
 
       const willPlaceBuy = shouldPlaceBuy && (config.orderConfig.side === 'Buy' || config.orderConfig.side === 'Both');
       const willPlaceSell = shouldPlaceSell && (config.orderConfig.side === 'Sell' || config.orderConfig.side === 'Both');
@@ -192,13 +456,39 @@ export class StrategyExecutor {
       // 8. PLACE BUY ORDER
       // ---------------------------------------------------------------
       const skipReasons: string[] = [];
+      let aggregateCapHit = false;
 
       if (willPlaceBuy) {
-        const buyOrder = await this.placeBuyOrder(market, config, prices.buyPrice, balances, ticker, orderBook);
-        if (buyOrder) {
-          orders.push(buyOrder);
+        // Slippage cap precheck for Market orders.
+        const slippageSkip = this.checkSlippageCap(
+          market, config, prices.buyPrice, 'Buy', orderBook, balances,
+        );
+        if (slippageSkip) {
+          skipReasons.push(slippageSkip);
         } else {
-          skipReasons.push(this.diagnoseBuySkip(market, config, prices.buyPrice, balances));
+          // Aggregate position cap precheck.
+          if (aggregateCap !== undefined && aggregateCap > 0) {
+            const projectedNotional = this.estimateBuyNotional(market, config, prices.buyPrice, balances);
+            if (aggregateOpenUsd + projectedNotional > aggregateCap) {
+              aggregateCapHit = true;
+              skipReasons.push(`Buy: aggregate open $${aggregateOpenUsd.toFixed(2)} + new $${projectedNotional.toFixed(2)} exceeds cap $${aggregateCap}`);
+            }
+          }
+
+          if (!aggregateCapHit) {
+            const buyOrder = await this.placeBuyOrder(market, config, prices.buyPrice, balances, ticker, orderBook);
+            if (buyOrder) {
+              orders.push(buyOrder);
+              if (buyOrder.success) {
+                this.failureTracker.recordSuccess(market.market_id);
+                aggregateOpenUsd += this.estimateBuyNotional(market, config, prices.buyPrice, balances);
+              } else {
+                this.recordFailureAndMaybePause(market, config, `Buy: ${buyOrder.error ?? 'unknown'}`);
+              }
+            } else {
+              skipReasons.push(this.diagnoseBuySkip(market, config, prices.buyPrice, balances));
+            }
+          }
         }
       } else if (!shouldPlaceBuy && (config.orderConfig.side === 'Buy' || config.orderConfig.side === 'Both')) {
         skipReasons.push('Buy: max open orders reached');
@@ -226,11 +516,35 @@ export class StrategyExecutor {
           }
         }
 
-        const sellOrder = await this.placeSellOrder(market, configForSell, prices.sellPrice, balances, ticker, orderBook);
-        if (sellOrder) {
-          orders.push(sellOrder);
+        const slippageSkip = this.checkSlippageCap(
+          market, configForSell, prices.sellPrice, 'Sell', orderBook, balances,
+        );
+        if (slippageSkip) {
+          skipReasons.push(slippageSkip);
         } else {
-          skipReasons.push(this.diagnoseSellSkip(market, configForSell, prices.sellPrice, balances));
+          let sellAggregateBreach = false;
+          if (aggregateCap !== undefined && aggregateCap > 0) {
+            const projectedNotional = this.estimateSellNotional(market, configForSell, prices.sellPrice, balances);
+            if (aggregateOpenUsd + projectedNotional > aggregateCap) {
+              sellAggregateBreach = true;
+              aggregateCapHit = true;
+              skipReasons.push(`Sell: aggregate open $${aggregateOpenUsd.toFixed(2)} + new $${projectedNotional.toFixed(2)} exceeds cap $${aggregateCap}`);
+            }
+          }
+
+          if (!sellAggregateBreach) {
+            const sellOrder = await this.placeSellOrder(market, configForSell, prices.sellPrice, balances, ticker, orderBook);
+            if (sellOrder) {
+              orders.push(sellOrder);
+              if (sellOrder.success) {
+                this.failureTracker.recordSuccess(market.market_id);
+              } else {
+                this.recordFailureAndMaybePause(market, config, `Sell: ${sellOrder.error ?? 'unknown'}`);
+              }
+            } else {
+              skipReasons.push(this.diagnoseSellSkip(market, configForSell, prices.sellPrice, balances));
+            }
+          }
         }
       } else if (!shouldPlaceSell && (config.orderConfig.side === 'Sell' || config.orderConfig.side === 'Both')) {
         skipReasons.push('Sell: max open orders reached');
@@ -246,6 +560,7 @@ export class StrategyExecutor {
         executed: successfulOrders.length > 0,
         orders,
         nextRunAt,
+        diagnostics,
       };
 
       // Surface reasons when no orders were successfully placed
@@ -257,6 +572,20 @@ export class StrategyExecutor {
         allReasons.push(...skipReasons);
         if (allReasons.length > 0) {
           result.skipReason = `${pair}: ${allReasons.join('; ')}`;
+        }
+        // Pick a stable category. Aggregate-cap takes priority since it's an explicit cap.
+        if (aggregateCapHit) {
+          result.skipCategory = 'aggregate_cap_hit';
+        } else if (skipReasons.some(r => r.includes('max open orders'))) {
+          result.skipCategory = 'max_open_orders';
+        } else if (skipReasons.some(r => r.toLowerCase().includes('slippage'))) {
+          result.skipCategory = 'slippage_exceeded';
+        } else if (skipReasons.some(r => r.toLowerCase().includes('insufficient') || r.toLowerCase().includes('balance'))) {
+          result.skipCategory = 'insufficient_balance';
+        } else if (skipReasons.some(r => r.toLowerCase().includes('avg buy price') || r.toLowerCase().includes('profit protection'))) {
+          result.skipCategory = 'profit_floor';
+        } else if (allReasons.length > 0) {
+          result.skipCategory = 'other';
         }
       }
 
@@ -276,8 +605,219 @@ export class StrategyExecutor {
           },
         ],
         skipReason: errMsg,
+        skipCategory: 'other',
+        diagnostics,
       };
     }
+  }
+
+  // =========================================================================
+  // RESULT / DIAGNOSTICS HELPERS
+  // =========================================================================
+
+  /** Build a uniform "skipped" result with structured category + diagnostics. */
+  private buildSkipResult(
+    nextRunAt: number,
+    skipReason: string,
+    skipCategory: SkipCategory,
+    diagnostics: ExecutionDiagnostics,
+  ): StrategyExecutionResult {
+    return {
+      executed: false,
+      orders: [],
+      nextRunAt,
+      skipReason,
+      skipCategory,
+      diagnostics,
+    };
+  }
+
+  /**
+   * Tracks consecutive failures for a market and, on threshold hit, sets
+   * `this.autoPauseRequested` for the trading-engine agent to consume.
+   */
+  private recordFailureAndMaybePause(
+    market: Market,
+    config: StrategyConfig,
+    reason: string,
+  ): void {
+    const threshold = config.riskManagement.autoPauseOnConsecutiveFailures;
+    const count = this.failureTracker.recordFailure(market.market_id);
+    if (threshold && threshold > 0 && count >= threshold) {
+      // Hand-off — the trading-engine agent reads `autoPauseRequested` and acts.
+      this.autoPauseRequested = {
+        reason: `${market.base.symbol}/${market.quote.symbol}: ${count} consecutive order failures — ${reason}`,
+        timestamp: Date.now(),
+        marketId: market.market_id,
+      };
+    }
+  }
+
+  /**
+   * Estimate slippage for a market order by walking the relevant orderbook side via
+   * the existing VWAP helpers. Returns a populated skip-reason string when over cap,
+   * or null when within cap (or feature disabled).
+   */
+  private checkSlippageCap(
+    market: Market,
+    config: StrategyConfig,
+    price: Decimal,
+    side: 'Buy' | 'Sell',
+    orderBook: OrderBookDepth | null,
+    balances: MarketBalances,
+  ): string | null {
+    const cap = config.orderConfig.slippageMaxPercent;
+    if (cap === undefined || cap <= 0) return null;
+    if (config.orderConfig.orderType !== 'Market') return null;
+    if (!orderBook) return null;
+
+    const isMarketOrder = true;
+    const orderSize = this.calculateOrderSize(
+      market,
+      config.positionSizing,
+      balances,
+      side === 'Buy' ? 'buy' : 'sell',
+      price,
+      isMarketOrder,
+    );
+    if (!orderSize || orderSize.quantity.lte(0)) return null;
+
+    const levels = side === 'Buy' ? orderBook.asks : orderBook.bids;
+    const vwap = this.calculateVWAP(
+      levels,
+      orderSize.quantity,
+      market.quote.decimals,
+      market.base.decimals,
+    );
+    if (!vwap || vwap.lte(0)) return null;
+
+    // Reference price = top of opposing book for that side (best ask for buy, best bid for sell).
+    const top = levels?.[0]?.[0];
+    if (!top) return null;
+    const reference = new Decimal(top).div(new Decimal(10).pow(market.quote.decimals));
+    if (reference.lte(0)) return null;
+
+    const slippagePct = vwap.minus(reference).abs().div(reference).mul(100).toNumber();
+    if (slippagePct > cap) {
+      return `${side}: estimated slippage ${slippagePct.toFixed(3)}% exceeds cap ${cap}%`;
+    }
+    return null;
+  }
+
+  /** Reuse the stop-loss exit path for trailing-stop triggers. */
+  private async executeTrailingStopExit(
+    market: Market,
+    config: StrategyConfig,
+    currentPrice: Decimal,
+  ): Promise<{ orders: OrderExecution[] }> {
+    const orders: OrderExecution[] = [];
+    try {
+      await this.orderManager.cancelAllOrders(market);
+    } catch (err) {
+      console.error(`[StrategyExecutor] Trailing stop: failed to cancel orders:`, err);
+    }
+
+    this.balanceTracker.clearCache(market.market_id);
+    const balances = await this.balanceTracker.getMarketBalances(market.market_id);
+    const baseBalanceHuman = new Decimal(balances.base.unlocked).div(new Decimal(10).pow(market.base.decimals));
+    if (baseBalanceHuman.lte(0)) return { orders };
+
+    const orderValueUsd = baseBalanceHuman.mul(currentPrice).toNumber();
+    if (orderValueUsd < config.positionSizing.minOrderSizeUsd) return { orders };
+
+    try {
+      const quantityRounded = roundDownToMarketPrecision(baseBalanceHuman, market);
+      const quantityScaled = quantityRounded.mul(new Decimal(10).pow(market.base.decimals)).toFixed(0);
+      const sellPriceTruncated = scaleUpAndTruncateToInt(
+        currentPrice,
+        market.quote.decimals,
+        market.quote.max_precision,
+        market.tick_size,
+      );
+      const sellPriceScaled = sellPriceTruncated.toFixed(0);
+
+      const resp = await this.orderManager.placeOrder(
+        market,
+        'Sell',
+        'Market',
+        sellPriceScaled,
+        quantityScaled,
+      );
+
+      const marketPair = `${market.base.symbol}/${market.quote.symbol}`;
+      const quantityPrecision = Math.min(market.base.decimals, 8);
+      const orderId = resp.orders?.[0]?.order_id || '';
+      orders.push({
+        orderId,
+        side: 'Sell',
+        success: true,
+        price: sellPriceScaled,
+        quantity: quantityScaled,
+        priceHuman: formatPrice(currentPrice),
+        quantityHuman: quantityRounded.toFixed(quantityPrecision).replace(/\.?0+$/, ''),
+        marketPair,
+      });
+
+      // Clear runtime state after exit.
+      const updatedConfig = { ...config };
+      updatedConfig.averageBuyPrice = '0';
+      updatedConfig.trailingPeakPrice = undefined;
+      updatedConfig.lastFillPrices = {
+        buy: [],
+        sell: config.lastFillPrices?.sell || [],
+      };
+      dbQueries.upsertStrategyConfig(market.market_id, updatedConfig);
+    } catch (error: any) {
+      const marketPair = `${market.base.symbol}/${market.quote.symbol}`;
+      orders.push({
+        orderId: '',
+        side: 'Sell',
+        success: false,
+        error: `Trailing stop sell failed: ${error.message}`,
+        errorDetails: error,
+        marketPair,
+      });
+    }
+
+    return { orders };
+  }
+
+  /** Estimate USD notional of a prospective buy order (used for aggregate-cap precheck). */
+  private estimateBuyNotional(
+    market: Market,
+    config: StrategyConfig,
+    price: Decimal,
+    balances: MarketBalances,
+  ): number {
+    if (!isValidPrice(price)) return 0;
+    const isMarketOrder = config.orderConfig.orderType !== 'Spot';
+    const sz = this.calculateOrderSize(market, config.positionSizing, balances, 'buy', price, isMarketOrder);
+    if (!sz) return 0;
+    const qty = roundDownToMarketPrecision(sz.quantity, market);
+    return qty.mul(price).toNumber();
+  }
+
+  /**
+   * Returns true when the configured order type will cross the spread (and thus
+   * needs the calculateOrderSize slippage buffer). PostOnly is non-marketable.
+   */
+  private isMarketableOrderType(orderType: StrategyConfig['orderConfig']['orderType']): boolean {
+    return orderType === 'Market' || orderType === 'IOC' || orderType === 'FOK';
+  }
+
+  /** Estimate USD notional of a prospective sell order (used for aggregate-cap precheck). */
+  private estimateSellNotional(
+    market: Market,
+    config: StrategyConfig,
+    price: Decimal,
+    balances: MarketBalances,
+  ): number {
+    if (!isValidPrice(price)) return 0;
+    const isMarketOrder = config.orderConfig.orderType !== 'Spot';
+    const sz = this.calculateOrderSize(market, config.positionSizing, balances, 'sell', price, isMarketOrder);
+    if (!sz) return 0;
+    const qty = roundDownToMarketPrecision(sz.quantity, market);
+    return qty.mul(price).toNumber();
   }
 
   // =========================================================================
@@ -424,7 +964,12 @@ export class StrategyExecutor {
     market: Market,
     ticker: { last_price: string; bid?: string; ask?: string },
     orderBook: OrderBookDepth | null,
-    orderConfig: StrategyConfig['orderConfig']
+    orderConfig: StrategyConfig['orderConfig'],
+    adjustments?: {
+      realizedVolPercent?: number;
+      buySkewPercent?: number;
+      sellSkewPercent?: number;
+    },
   ): { buyPrice: Decimal; sellPrice: Decimal } {
     let referencePrice: Decimal;
     const quoteScale = new Decimal(10).pow(market.quote.decimals);
@@ -465,9 +1010,41 @@ export class StrategyExecutor {
         break;
     }
 
+    // Compute the effective per-side offset, applying optional vol-adaptive scaling.
+    const baseOffsetPercent = orderConfig.priceOffsetPercent;
+
+    let effectiveOffsetPercent = baseOffsetPercent;
+    if (
+      orderConfig.volatilityAdaptiveSpreadEnabled &&
+      adjustments?.realizedVolPercent !== undefined
+    ) {
+      const mult = orderConfig.volatilitySpreadMultiplier ?? 0;
+      const vol = adjustments.realizedVolPercent;
+      // offset_effective = offset * (1 + multiplier * realizedVolPercent)
+      effectiveOffsetPercent = baseOffsetPercent * (1 + mult * vol);
+    }
+
+    // Apply optional inventory skew (asymmetric):
+    //   - When holding too much base (deviation > 0): widen buy (push price down)
+    //     by adding to the buy offset, tighten sell (push price down toward reference)
+    //     by subtracting from the sell offset.
+    //   - When holding too little base (deviation < 0): the signs flip naturally
+    //     because buySkewPercent / sellSkewPercent are signed.
+    let buyOffsetPercent = effectiveOffsetPercent;
+    let sellOffsetPercent = effectiveOffsetPercent;
+    if (orderConfig.inventorySkewEnabled) {
+      const buySkew = adjustments?.buySkewPercent ?? 0;
+      const sellSkew = adjustments?.sellSkewPercent ?? 0;
+      buyOffsetPercent = effectiveOffsetPercent + buySkew;
+      sellOffsetPercent = effectiveOffsetPercent - sellSkew;
+      // Guard against non-positive offsets that could invert prices.
+      if (buyOffsetPercent < 0) buyOffsetPercent = 0;
+      if (sellOffsetPercent < 0) sellOffsetPercent = 0;
+    }
+
     // Apply offset: buy BELOW reference (subtract offset), sell ABOVE (add offset)
-    let buyPrice = referencePrice.mul(1 - orderConfig.priceOffsetPercent / 100);
-    let sellPrice = referencePrice.mul(1 + orderConfig.priceOffsetPercent / 100);
+    let buyPrice = referencePrice.mul(1 - buyOffsetPercent / 100);
+    let sellPrice = referencePrice.mul(1 + sellOffsetPercent / 100);
 
     // Apply price randomization if enabled
     if (orderConfig.priceRandomizationEnabled && orderConfig.priceRandomizationRangePercent) {
@@ -613,16 +1190,17 @@ export class StrategyExecutor {
     if (orderBook?.asks?.length && orderBook.asks[0]?.[0]) {
       const bestAskPrice = new Decimal(orderBook.asks[0][0]).div(new Decimal(10).pow(market.quote.decimals));
       if (buyPriceHuman.gt(bestAskPrice)) {
-        if (config.orderConfig.orderType === 'Spot') {
-          // Cap buy price to best ask to avoid immediate crossing for limit orders
+        // Cap buy price to best ask for any non-marketable / limit-style order type
+        // to avoid immediate unfavorable crossing. PostOnly must never cross either.
+        if (config.orderConfig.orderType === 'Spot' || config.orderConfig.orderType === 'PostOnly') {
           buyPriceHuman = bestAskPrice;
         }
-        // For market orders, crossing is expected -- no cap needed
+        // For Market / IOC / FOK, crossing is expected — no cap needed.
       }
     }
 
-    // Calculate order size
-    const isMarketOrder = config.orderConfig.orderType !== 'Spot';
+    // Calculate order size — slippage buffer only applies to marketable order types.
+    const isMarketOrder = this.isMarketableOrderType(config.orderConfig.orderType);
     const orderSize = this.calculateOrderSize(market, config.positionSizing, balances, 'buy', buyPriceHuman, isMarketOrder);
     if (!orderSize || orderSize.quantity.eq(0)) {
       return null;
@@ -650,7 +1228,15 @@ export class StrategyExecutor {
     const marketPair = `${market.base.symbol}/${market.quote.symbol}`;
 
     try {
-      const orderType = config.orderConfig.orderType === 'Spot' ? 'Spot' : 'Market';
+      // Map strategy-level order types to order-manager order types. Existing
+      // 'Market'/'Spot' code paths are preserved; new 'PostOnly'|'IOC'|'FOK'
+      // are forwarded as-is to OrderManager which maps to the contract enum.
+      const cfgType = config.orderConfig.orderType;
+      let orderType: string;
+      if (cfgType === 'Spot') orderType = 'Spot';
+      else if (cfgType === 'PostOnly' || cfgType === 'IOC' || cfgType === 'FOK') orderType = cfgType;
+      else orderType = 'Market';
+
       const resp = await this.orderManager.placeOrder(
         market,
         'Buy',
@@ -667,7 +1253,9 @@ export class StrategyExecutor {
         }
       }
 
-      const isLimitOrder = config.orderConfig.orderType === 'Spot';
+      // PostOnly behaves like a limit order from the user's perspective;
+      // IOC/FOK execute immediately like Market but at the specified price cap.
+      const isLimitOrder = config.orderConfig.orderType === 'Spot' || config.orderConfig.orderType === 'PostOnly';
       const quantityPrecision = Math.min(market.base.decimals, 8);
       const orderId = resp.orders?.[0]?.order_id || '';
 
@@ -743,7 +1331,7 @@ export class StrategyExecutor {
     }
 
     // Calculate order size (no slippage buffer for forced limit orders)
-    const isSellMarketOrder = !forceLimitOrder && config.orderConfig.orderType !== 'Spot';
+    const isSellMarketOrder = !forceLimitOrder && this.isMarketableOrderType(config.orderConfig.orderType);
     const orderSize = this.calculateOrderSize(market, config.positionSizing, balances, 'sell', adjustedSellPrice, isSellMarketOrder);
     if (!orderSize || orderSize.quantity.eq(0)) {
       return null;
@@ -771,10 +1359,17 @@ export class StrategyExecutor {
     const marketPair = `${market.base.symbol}/${market.quote.symbol}`;
 
     try {
-      // Use Spot (limit) when forcing limit for profit protection, otherwise use configured type
-      const orderType = forceLimitOrder
-        ? 'Spot'
-        : (config.orderConfig.orderType === 'Spot' ? 'Spot' : 'Market');
+      // Use Spot (limit) when forcing limit for profit protection, otherwise use configured type.
+      // Forward extended types (PostOnly | IOC | FOK) to OrderManager which maps to the contract enum.
+      let orderType: string;
+      if (forceLimitOrder) {
+        orderType = 'Spot';
+      } else {
+        const cfgType = config.orderConfig.orderType;
+        if (cfgType === 'Spot') orderType = 'Spot';
+        else if (cfgType === 'PostOnly' || cfgType === 'IOC' || cfgType === 'FOK') orderType = cfgType;
+        else orderType = 'Market';
+      }
 
       const resp = await this.orderManager.placeOrder(
         market,
@@ -792,7 +1387,9 @@ export class StrategyExecutor {
         }
       }
 
-      const isLimitOrder = forceLimitOrder || config.orderConfig.orderType === 'Spot';
+      const isLimitOrder = forceLimitOrder
+        || config.orderConfig.orderType === 'Spot'
+        || config.orderConfig.orderType === 'PostOnly';
       const quantityPrecision = Math.min(market.base.decimals, 8);
       const orderId = resp.orders?.[0]?.order_id || '';
 
@@ -873,7 +1470,7 @@ export class StrategyExecutor {
   ): string {
     if (!isValidPrice(buyPrice)) return 'Buy: invalid price (0/NaN)';
     const quoteHuman = new Decimal(balances.quote.unlocked).div(new Decimal(10).pow(market.quote.decimals));
-    const orderSize = this.calculateOrderSize(market, config.positionSizing, balances, 'buy', buyPrice, config.orderConfig.orderType !== 'Spot');
+    const orderSize = this.calculateOrderSize(market, config.positionSizing, balances, 'buy', buyPrice, this.isMarketableOrderType(config.orderConfig.orderType));
     if (!orderSize) return `Buy: order size calc failed (quote=${quoteHuman.toFixed(2)}, price=${buyPrice.toFixed(4)})`;
     if (orderSize.quantity.eq(0)) return 'Buy: quantity rounds to 0';
     const quantityRounded = roundDownToMarketPrecision(orderSize.quantity, market);
@@ -900,7 +1497,7 @@ export class StrategyExecutor {
     }
     if (!isValidPrice(sellPrice)) return 'Sell: invalid price (0/NaN)';
     const baseHuman = new Decimal(balances.base.unlocked).div(new Decimal(10).pow(market.base.decimals));
-    const orderSize = this.calculateOrderSize(market, config.positionSizing, balances, 'sell', sellPrice, config.orderConfig.orderType !== 'Spot');
+    const orderSize = this.calculateOrderSize(market, config.positionSizing, balances, 'sell', sellPrice, this.isMarketableOrderType(config.orderConfig.orderType));
     if (!orderSize) return `Sell: order size calc failed (base=${baseHuman.toFixed(6)}, price=${sellPrice.toFixed(4)})`;
     if (orderSize.quantity.eq(0)) return 'Sell: quantity rounds to 0';
     const quantityRounded = roundDownToMarketPrecision(orderSize.quantity, market);

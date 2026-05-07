@@ -551,6 +551,15 @@ async function startBot(opts: {
       logger.error(`Failed to cancel orders: ${err}`, 'Shutdown');
     }
 
+    // Drain any settled-but-not-withdrawn balances back to the trade account
+    // so nothing is left stranded in the orderbook contract on restart.
+    logger.info('Settling balances...', 'Shutdown');
+    try {
+      await engine.settleAllBalances();
+    } catch (err) {
+      logger.error(`Failed to settle balances: ${err}`, 'Shutdown');
+    }
+
     // Cleanup
     orderManager.shutdown();
     balanceTracker.shutdown();

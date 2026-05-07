@@ -1,0 +1,47 @@
+{
+  "name": "Drain",
+  "isActive": true,
+
+  "orderConfig": {
+    "orderType": "Market",
+    "priceMode": "market",
+    "priceOffsetPercent": 0,
+    "maxSpreadPercent": 50,
+    "side": "Sell",
+    "priceRandomizationEnabled": false
+  },
+
+  "positionSizing": {
+    "sizeMode": "percentageOfBalance",
+    "balancePercentage": 100,
+    "baseBalancePercentage": 100,
+    "quoteBalancePercentage": 0,
+    "minOrderSizeUsd": 1
+  },
+
+  "orderManagement": {
+    "trackFillPrices": true,
+    "onlySellAboveBuyPrice": false,
+    "maxOpenOrders": 1
+  },
+
+  "riskManagement": {
+    "takeProfitPercent": 0,
+    "stopLossEnabled": false,
+    "stopLossPercent": 0,
+    "orderTimeoutEnabled": false,
+    "orderTimeoutMinutes": 30,
+    "maxSessionLossEnabled": false,
+    "maxSessionLossUsd": 1000,
+    "maxDailyLossEnabled": false,
+    "maxDailyLossUsd": 5000,
+    "dailyLossResetUtcHour": 0,
+    "autoPauseOnConsecutiveFailures": 5,
+    "autoPauseOnWsDownSeconds": 60
+  },
+
+  "timing": {
+    "cycleIntervalMinMs": 1500,
+    "cycleIntervalMaxMs": 2500
+  }
+}
