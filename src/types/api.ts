@@ -8,6 +8,11 @@ export interface SessionAction {
     order_type: string;
     price: string;
     quantity: string;
+    // BoundedMarket price band (scaled integers). Present only when
+    // order_type === 'BoundedMarket'. Buy: [0, ref*(1+slippage)],
+    // Sell: [ref*(1-slippage), u64::MAX].
+    max_price?: string;
+    min_price?: string;
   };
   CancelOrder?: {
     order_id: string;

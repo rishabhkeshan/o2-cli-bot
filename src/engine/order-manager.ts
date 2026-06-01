@@ -18,6 +18,38 @@ export interface FillEvent {
   fee: number;
 }
 
+// Default slippage tolerance (%) applied to BoundedMarket orders when a caller
+// does not supply one explicitly (e.g. stop-loss / trailing / flatten paths).
+export const DEFAULT_BOUNDED_SLIPPAGE_PERCENT = 2;
+
+/**
+ * Compute the [min_price, max_price] band for a BoundedMarket order from a
+ * scaled reference price and a slippage tolerance expressed in percent.
+ *
+ *   Buy  → may walk UP to ref*(1+s):  { minPrice: 0,            maxPrice: ref*(1+s) }
+ *   Sell → may walk DOWN to ref*(1-s): { minPrice: ref*(1-s),  maxPrice: u64::MAX  }
+ *
+ * Fixed-point math (SCALE = 1e6) preserves precision on integer prices.
+ * Mirrors o2-multi-bot's computeBoundedBand.
+ */
+export function computeBoundedBand(
+  refPriceScaled: string,
+  side: string,
+  slippagePercent: number
+): { maxPrice: string; minPrice: string } {
+  const SCALE = 1_000_000n;
+  const slip = Math.max(0, slippagePercent) / 100;
+  const ref = BigInt(refPriceScaled || '0');
+  const U64_MAX = (1n << 64n) - 1n;
+
+  if (side === 'Buy') {
+    const upScale = BigInt(Math.floor((1 + slip) * Number(SCALE)));
+    return { maxPrice: ((ref * upScale) / SCALE).toString(), minPrice: '0' };
+  }
+  const downScale = BigInt(Math.floor((1 - slip) * Number(SCALE)));
+  return { maxPrice: U64_MAX.toString(), minPrice: ((ref * downScale) / SCALE).toString() };
+}
+
 export class OrderManager extends EventEmitter {
   private sessionManager: SessionManager;
   private restClient: O2RestClient;
@@ -74,25 +106,29 @@ export class OrderManager extends EventEmitter {
   }
 
   // Place an order with SettleBalance sandwich
-  // orderType accepts the legacy values 'Market'|'Spot' as well as the extended
-  // strategy values 'PostOnly'|'IOC'|'FOK'|'Limit'. Extended values are mapped to the
-  // contract's enum here so existing callers using 'Market'/'Spot' are unaffected.
+  // orderType accepts the contract values 'BoundedMarket'|'Market'|'Spot' as well as
+  // the extended strategy values 'PostOnly'|'IOC'|'FOK'|'Limit'. Extended values are
+  // mapped to the contract's enum here. 'BoundedMarket' is now the default marketable
+  // type: it walks the book within a slippage band instead of filling unbounded.
   // Note: the underlying contract has no native ImmediateOrCancel — we map IOC -> FillOrKill
-  // (see session-manager.ts switch). If neither is acceptable, callers should fall back
-  // to 'Market' explicitly.
+  // (see session-manager.ts switch).
+  // `slippagePercent` is only consulted for BoundedMarket orders; it defaults to
+  // DEFAULT_BOUNDED_SLIPPAGE_PERCENT (2%) when omitted.
   async placeOrder(
     market: Market,
     side: string,
     orderType: string,
     priceScaled: string,
-    quantityScaled: string
+    quantityScaled: string,
+    slippagePercent: number = DEFAULT_BOUNDED_SLIPPAGE_PERCENT
   ): Promise<SessionActionsResponse> {
     const tradeAccountId = this.sessionManager.tradeAccount;
 
     // Map strategy-level order types to contract-level enum values understood by
-    // session-manager.submitActionsImpl (PostOnly | Limit | Spot | Market | FillOrKill).
+    // session-manager.submitActionsImpl (PostOnly | Limit | Spot | Market | BoundedMarket | FillOrKill).
     let contractOrderType = orderType;
     switch (orderType) {
+      case 'BoundedMarket':
       case 'Market':
       case 'Spot':
       case 'Limit':
@@ -108,8 +144,15 @@ export class OrderManager extends EventEmitter {
         contractOrderType = 'FillOrKill';
         break;
       default:
-        console.warn(`[OrderManager] Unknown orderType "${orderType}", falling back to Market`);
-        contractOrderType = 'Market';
+        console.warn(`[OrderManager] Unknown orderType "${orderType}", falling back to BoundedMarket`);
+        contractOrderType = 'BoundedMarket';
+    }
+
+    // For BoundedMarket orders, derive the [min,max] price band from the
+    // reference price and the configured slippage tolerance.
+    let boundedBand: { maxPrice: string; minPrice: string } | undefined;
+    if (contractOrderType === 'BoundedMarket') {
+      boundedBand = computeBoundedBand(priceScaled, side, slippagePercent);
     }
 
     const actions: SessionAction[] = [
@@ -120,6 +163,9 @@ export class OrderManager extends EventEmitter {
           order_type: contractOrderType,
           price: priceScaled,
           quantity: quantityScaled,
+          ...(boundedBand
+            ? { max_price: boundedBand.maxPrice, min_price: boundedBand.minPrice }
+            : {}),
         },
       },
       { SettleBalance: { to: { ContractId: tradeAccountId } } },

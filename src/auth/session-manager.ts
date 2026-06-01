@@ -254,7 +254,7 @@ export class SessionManager extends EventEmitter {
           : { Address: { bits: (to as any).Address } };
         invocationScope = orderBookContract.functions.settle_balance(identity);
       } else if (action.CreateOrder) {
-        const { side, price, quantity, order_type } = action.CreateOrder;
+        const { side, price, quantity, order_type, max_price, min_price } = action.CreateOrder;
         let swayOrderType: any;
         switch (order_type) {
           case 'PostOnly': swayOrderType = { PostOnly: undefined }; break;
@@ -262,6 +262,15 @@ export class SessionManager extends EventEmitter {
           case 'Spot': swayOrderType = { Spot: undefined }; break;
           case 'Market': swayOrderType = { Market: undefined }; break;
           case 'FillOrKill': swayOrderType = { FillOrKill: undefined }; break;
+          case 'BoundedMarket':
+            // Sway variant is a (max_price, min_price) tuple of u64.
+            swayOrderType = {
+              BoundedMarket: [
+                bn((max_price ?? price).toString()),
+                bn((min_price ?? '0').toString()),
+              ],
+            };
+            break;
           default: swayOrderType = { Market: undefined };
         }
 

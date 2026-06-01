@@ -2,7 +2,8 @@
   "marketId": "default",
   "name": "Volume Maximizing",
   "orderConfig": {
-    "orderType": "Market",
+    "orderType": "BoundedMarket",
+    "boundedSlippagePercent": 2,
     "priceMode": "market",
     "priceOffsetPercent": 0,
     "maxSpreadPercent": 5.0,

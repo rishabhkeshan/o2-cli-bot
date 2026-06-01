@@ -6,6 +6,7 @@ export enum OrderSide {
 export enum OrderType {
   Spot = 'Spot',
   Market = 'Market',
+  BoundedMarket = 'BoundedMarket',
   Limit = 'Limit',
   FillOrKill = 'FillOrKill',
   PostOnly = 'PostOnly',

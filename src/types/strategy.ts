@@ -1,7 +1,7 @@
 // ============================================
 // CORE ORDER CONFIGURATION
 // ============================================
-export type OrderTypeName = 'Market' | 'Spot' | 'PostOnly' | 'IOC' | 'FOK';
+export type OrderTypeName = 'BoundedMarket' | 'Market' | 'Spot' | 'PostOnly' | 'IOC' | 'FOK';
 
 export interface OrderConfig {
   // Order Type
@@ -23,6 +23,11 @@ export interface OrderConfig {
 
   // Slippage cap on Market orders — abort placement if estimated VWAP slippage exceeds this %
   slippageMaxPercent?: number;
+
+  // BoundedMarket slippage tolerance (%). Defines the price band the order may
+  // walk before the matching engine stops: Buy fills up to ref*(1+x%), Sell
+  // fills down to ref*(1-x%). Defaults to 2% when omitted.
+  boundedSlippagePercent?: number;
 
   // Auto-replace open orders if reference price has drifted by more than this % since placement
   autoReplaceOnDriftPercent?: number;
@@ -176,7 +181,8 @@ export function getDefaultStrategyConfig(marketId: string): StrategyConfig {
     name: 'Default Trading Strategy',
 
     orderConfig: {
-      orderType: 'Market',
+      orderType: 'BoundedMarket',
+      boundedSlippagePercent: 2, // Walk up to 2% past the reference price
       priceMode: 'offsetFromMid',
       priceOffsetPercent: 0.1, // 0.1% from mid price
       maxSpreadPercent: 2.0, // Don't trade if spread > 2%
@@ -265,7 +271,7 @@ export function getPresetStrategyConfig(marketId: string, preset: StrategyPreset
         name: 'Volume Maximizing',
         orderConfig: {
           ...base.orderConfig,
-          orderType: 'Market',
+          orderType: 'BoundedMarket',
           priceMode: 'market',
           priceOffsetPercent: 0,
           maxSpreadPercent: 5.0,
@@ -318,7 +324,7 @@ export function getPresetStrategyConfig(marketId: string, preset: StrategyPreset
         name: 'Competition Mode',
         orderConfig: {
           ...base.orderConfig,
-          orderType: 'Market',
+          orderType: 'BoundedMarket',
           priceMode: 'offsetFromMid',
           priceOffsetPercent: 0.02,
           maxSpreadPercent: 5.0,

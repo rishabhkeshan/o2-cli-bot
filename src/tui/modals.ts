@@ -684,7 +684,7 @@ export function showHelpOverlay(
 // ─── Order entry modal (manual buy/sell) ──────────────────
 // A rich, live-updating order ticket modeled on the O2 web app:
 //   - Always-visible balances, market prices, fees and min-order
-//   - Side toggle (Buy/Sell) and Order-type toggle (Limit/Market/PostOnly/IOC/FOK)
+//   - Side toggle (Buy/Sell) and Order-type toggle (Limit/BoundedMarket/PostOnly/IOC/FOK)
 //   - Price field accepting numeric or shortcuts: m|mid, b|bid, a|ask
 //   - Quantity field accepting numeric or "<n>%"/max for % of available
 //   - Live-computed total, estimated fee, estimated slippage, status
@@ -705,12 +705,12 @@ export interface OrderEntryContext {
   initialSide?: 'Buy' | 'Sell';
 }
 
-export type OrderEntryType = 'Limit' | 'Market' | 'PostOnly' | 'IOC' | 'FOK';
+export type OrderEntryType = 'Limit' | 'BoundedMarket' | 'PostOnly' | 'IOC' | 'FOK';
 
 export interface OrderEntryResult {
   side: 'Buy' | 'Sell';
   orderType: OrderEntryType;
-  priceHuman: number;        // 0 if Market
+  priceHuman: number;        // reference price for BoundedMarket band; 0 for IOC/FOK
   quantityHuman: number;
 }
 
@@ -722,7 +722,7 @@ export function showOrderEntryModal(
     const previousFocus = (screen as any).focused as blessed.Widgets.BlessedElement | null;
     const shade = attachShade(screen);
 
-    const TYPES: OrderEntryType[] = ['Limit', 'Market', 'PostOnly', 'IOC', 'FOK'];
+    const TYPES: OrderEntryType[] = ['Limit', 'BoundedMarket', 'PostOnly', 'IOC', 'FOK'];
 
     const state: {
       side: 'Buy' | 'Sell';
@@ -837,9 +837,15 @@ export function showOrderEntryModal(
     let focusIdx = 0;
 
     // ─── Computation ────────────────────────────────────────
-    const resolvePrice = (): { value: number; isMarket: boolean; valid: boolean; reason?: string } => {
-      if (state.type === 'Market' || state.type === 'IOC' || state.type === 'FOK') {
-        // Marketable order types: ignore price input
+    const resolvePrice = (): { value: number; isMarket: boolean; valid: boolean; bounded?: boolean; reason?: string } => {
+      if (state.type === 'BoundedMarket' || state.type === 'IOC' || state.type === 'FOK') {
+        // Marketable order types ignore manual price input. BoundedMarket still
+        // needs a reference price so OrderManager can derive its slippage band —
+        // use the opposite top-of-book (fallback mid).
+        if (state.type === 'BoundedMarket') {
+          const ref = (state.side === 'Buy' ? ctx.bestAsk : ctx.bestBid) ?? ctx.midPrice ?? 0;
+          return { value: ref, isMarket: true, bounded: true, valid: ref > 0, reason: ref > 0 ? undefined : 'No reference price' };
+        }
         return { value: 0, isMarket: true, valid: true };
       }
       const raw = state.priceRaw.trim().toLowerCase();
@@ -1015,7 +1021,8 @@ export function showOrderEntryModal(
       resolve({
         side: state.side,
         orderType: state.type,
-        priceHuman: p.isMarket ? 0 : p.value,
+        // BoundedMarket carries its reference price through; IOC/FOK stay priceless.
+        priceHuman: p.bounded ? p.value : (p.isMarket ? 0 : p.value),
         quantityHuman: q.value,
       });
     };

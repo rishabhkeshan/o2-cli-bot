@@ -1399,7 +1399,11 @@ export class Dashboard {
       const activeStr = ctx.isActive ? tc(T.buy, 'ON') : tc(T.sell, 'OFF');
       content += `  ${tc(T.fg, ctx.strategy)} ${activeStr}`;
       if (cfg) {
-        const ot = cfg.orderConfig.orderType === 'Spot' ? 'Limit' : 'Market';
+        const ot = cfg.orderConfig.orderType === 'Spot'
+          ? 'Limit'
+          : cfg.orderConfig.orderType === 'BoundedMarket'
+            ? 'Bounded'
+            : cfg.orderConfig.orderType;
         const pm = cfg.orderConfig.priceMode;
         const side = cfg.orderConfig.side;
         content += `  ${tc(T.dim, `${ot} ${VLINE} ${pm} ${VLINE} ${side}`)}\n`;
@@ -1559,7 +1563,8 @@ export class Dashboard {
         const d = new Date(o.created_at);
         const time = fmtTimeFull(d.getTime());
         const side = o.side === 'Buy' ? tcB(T.buy, 'BUY ') : tcB(T.sell, 'SELL');
-        const orderType = (o.order_type || 'Market').padEnd(7);
+        const rawType = o.order_type || 'BoundedMarket';
+        const orderType = (rawType === 'BoundedMarket' ? 'Bounded' : rawType).padEnd(7);
         const price = '$' + fmtPrice(parseFloat(o.price) / qScale);
         const qty = fmtQty(parseFloat(o.quantity) / bScale);
         let status: string;
@@ -1910,7 +1915,7 @@ export class Dashboard {
         if (baseHuman > 0) {
           const baseScale = 10 ** market.base.decimals;
           const qtyScaled = String(Math.floor(baseHuman * baseScale));
-          await this.orderManager.placeOrder(market, 'Sell', 'Market', '0', qtyScaled);
+          await this.orderManager.placeOrder(market, 'Sell', 'BoundedMarket', '0', qtyScaled);
         }
       }
       this.addLog(`{green-fg}Flatten complete{/green-fg}`);

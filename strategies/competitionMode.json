@@ -2,7 +2,8 @@
   "marketId": "default",
   "name": "Competition Mode",
   "orderConfig": {
-    "orderType": "Market",
+    "orderType": "BoundedMarket",
+    "boundedSlippagePercent": 2,
     "priceMode": "offsetFromMid",
     "priceOffsetPercent": 0.02,
     "maxSpreadPercent": 5,

@@ -3,7 +3,8 @@
   "isActive": true,
 
   "orderConfig": {
-    "orderType": "Market",
+    "orderType": "BoundedMarket",
+    "boundedSlippagePercent": 2,
     "priceMode": "market",
     "priceOffsetPercent": 0,
     "maxSpreadPercent": 10,

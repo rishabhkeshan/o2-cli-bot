@@ -741,7 +741,7 @@ async function startBot(opts: {
           return `Cancelled orders. No ${m.base.symbol} balance to flatten.`;
         }
         try {
-          await orderManager.placeOrder(m, 'Sell', 'Market', '0', balances.base.unlocked);
+          await orderManager.placeOrder(m, 'Sell', 'BoundedMarket', '0', balances.base.unlocked);
           return `Flattened ${m.base.symbol}/${m.quote.symbol} (sold ${baseUnlocked / 10 ** m.base.decimals} ${m.base.symbol}).`;
         } catch (err: any) {
           return `Cancelled orders, but flatten failed: ${err?.message || err}`;

@@ -668,7 +668,7 @@ export class StrategyExecutor {
   ): string | null {
     const cap = config.orderConfig.slippageMaxPercent;
     if (cap === undefined || cap <= 0) return null;
-    if (config.orderConfig.orderType !== 'Market') return null;
+    if (!this.isMarketableOrderType(config.orderConfig.orderType)) return null;
     if (!orderBook) return null;
 
     const isMarketOrder = true;
@@ -739,9 +739,10 @@ export class StrategyExecutor {
       const resp = await this.orderManager.placeOrder(
         market,
         'Sell',
-        'Market',
+        'BoundedMarket',
         sellPriceScaled,
         quantityScaled,
+        config.orderConfig.boundedSlippagePercent,
       );
 
       const marketPair = `${market.base.symbol}/${market.quote.symbol}`;
@@ -802,7 +803,7 @@ export class StrategyExecutor {
    * needs the calculateOrderSize slippage buffer). PostOnly is non-marketable.
    */
   private isMarketableOrderType(orderType: StrategyConfig['orderConfig']['orderType']): boolean {
-    return orderType === 'Market' || orderType === 'IOC' || orderType === 'FOK';
+    return orderType === 'BoundedMarket' || orderType === 'Market' || orderType === 'IOC' || orderType === 'FOK';
   }
 
   /** Estimate USD notional of a prospective sell order (used for aggregate-cap precheck). */
@@ -900,9 +901,10 @@ export class StrategyExecutor {
       const resp = await this.orderManager.placeOrder(
         market,
         'Sell',
-        'Market',
+        'BoundedMarket',
         sellPriceScaled,
-        quantityScaled
+        quantityScaled,
+        config.orderConfig.boundedSlippagePercent
       );
 
       const marketPair = `${market.base.symbol}/${market.quote.symbol}`;
@@ -1235,14 +1237,15 @@ export class StrategyExecutor {
       let orderType: string;
       if (cfgType === 'Spot') orderType = 'Spot';
       else if (cfgType === 'PostOnly' || cfgType === 'IOC' || cfgType === 'FOK') orderType = cfgType;
-      else orderType = 'Market';
+      else orderType = 'BoundedMarket';
 
       const resp = await this.orderManager.placeOrder(
         market,
         'Buy',
         orderType,
         buyPriceScaled,
-        quantityScaled
+        quantityScaled,
+        config.orderConfig.boundedSlippagePercent
       );
 
       // Determine display price -- fallback to ticker if calculated price is invalid
@@ -1368,7 +1371,7 @@ export class StrategyExecutor {
         const cfgType = config.orderConfig.orderType;
         if (cfgType === 'Spot') orderType = 'Spot';
         else if (cfgType === 'PostOnly' || cfgType === 'IOC' || cfgType === 'FOK') orderType = cfgType;
-        else orderType = 'Market';
+        else orderType = 'BoundedMarket';
       }
 
       const resp = await this.orderManager.placeOrder(
@@ -1376,7 +1379,8 @@ export class StrategyExecutor {
         'Sell',
         orderType,
         sellPriceScaled,
-        quantityScaled
+        quantityScaled,
+        config.orderConfig.boundedSlippagePercent
       );
 
       // Determine display price
